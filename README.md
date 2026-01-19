@@ -41,12 +41,12 @@
 
 
 ### 2. 获取 DDNS 脚本并执行
-`curl -# -o /usr/local/bin/cloudflare_ddns.sh https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/refs/heads/main/cloudflare_ddns.sh` && chmod +x /usr/local/bin/cloudflare_ddns.sh && /usr/local/bin/cloudflare_ddns.sh
+`curl -# -o /usr/local/bin/cloudflare_ddns.sh https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/refs/heads/main/cloudflare_ddns.sh && chmod +x /usr/local/bin/cloudflare_ddns.sh && /usr/local/bin/cloudflare_ddns.sh`
 
 保存脚本路径为 `/usr/local/bin/cloudflare_ddns.sh`
 
 ###也可使用python版本的脚本
-`curl -# -o /usr/local/bin/cloudflare_ddns.py https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/refs/heads/main/cloudflare_ddns.py` && chmod +x /usr/local/bin/cloudflare_ddns.py && /usr/local/bin/cloudflare_ddns.py
+`curl -# -o /usr/local/bin/cloudflare_ddns.py https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/refs/heads/main/cloudflare_ddns.py && chmod +x /usr/local/bin/cloudflare_ddns.py && /usr/local/bin/cloudflare_ddns.py`
 
 保存脚本路径为 `/usr/local/bin/cloudflare_ddns.py`
 

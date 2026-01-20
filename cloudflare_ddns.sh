@@ -72,26 +72,13 @@ init_config() {
     create_config_dir
 
     usage() {
+        echo
         echo "Cloudflare DDNS 更新脚本"
-        echo "版本: 统一配置版 (支持删除旧配置)"
         echo
-        echo "用法:"
-        echo "  $0 [选项]"
-        echo
-        echo "选项:"
+        echo "option:"
         echo "  -h, --help            显示此帮助信息"
-        echo "  -delete      删除所有配置和日志文件"
-        echo "  -reconfig         重置配置文件并重新配置"
-        echo
-        echo "示例:"
-        echo "  $0                    正常执行DDNS更新"
-        echo "  $0 -delete    完全移除配置"
-        echo "  $0 -reconfig      重置配置文件"
-        echo
-        echo "说明:"
-        echo "  - 首次运行会自动进入配置向导"
-        echo "  - 配置存储在 $CFG_DIR"
-        echo "  - 日常使用无需添加参数直接运行即可"
+        echo "  -reconfig             重置配置文件并重新配置"
+        echo "  -delete               删除所有配置和日志文件"
     }
     
     # 处理命令行选项

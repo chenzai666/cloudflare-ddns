@@ -72,6 +72,8 @@
 `0 0 * * * find /root/.cloudflare_ddns/cloudflare_ddns.log -mtime +7 -delete`
 
 
+
+
 ### 4. 监控日志文件
 
 你可以使用以下命令监控日志：

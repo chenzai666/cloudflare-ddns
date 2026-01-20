@@ -28,6 +28,8 @@
 下次运行脚本将自动使用这些配置
 ══════════════════════════════════════════════════
 
+执行完成截图（示例）：
+
 <img width="698" height="322" alt="test" src="https://github.com/user-attachments/assets/b521c76c-de01-424a-9061-43f0a8bb4c31" />
 
 

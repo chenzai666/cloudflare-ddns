@@ -1,3 +1,17 @@
+### （new）新增配置文件重置、删除功能
+可以执行脚本在后边加上-h
+
+`/usr/local/bin/cloudflare_ddns.sh -h`
+
+<img width="574" height="247" alt="image" src="https://github.com/user-attachments/assets/6902c2ea-f3ee-4690-adf3-5e9793e26979" />
+
+
+`/usr/local/bin/cloudflare_ddns.py -h`
+
+<img width="589" height="266" alt="image" src="https://github.com/user-attachments/assets/4630d568-b84e-4cf6-b9b3-0c33b5ff727a" />
+
+
+
 # cloudflare-ddns使用方法
 先准备以下信息
 

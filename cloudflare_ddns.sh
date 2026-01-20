@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Cloudflare DDNS 更新脚本 (统一配置版)
+# 新增删除旧配置功能
 # 配置文件与日志存放在同一目录，交互输入支持默认值
 
 # 配置目录路径（所有配置和日志存储在此）
@@ -34,9 +35,87 @@ create_config_dir() {
     fi
 }
 
+# 删除配置文件
+delete() {
+    local config_dir=$(dirname "$CONFIG_FILE")
+    local deleted_files=()
+    
+    # 删除配置文件
+    if [ -f "$CONFIG_FILE" ]; then
+        rm -f "$CONFIG_FILE"
+        deleted_files+=("配置文件: $CONFIG_FILE")
+    fi
+    
+    # 删除日志文件（如果存在）
+    if [ -f "$LOG_FILE" ]; then
+        rm -f "$LOG_FILE"
+        deleted_files+=("日志文件: $LOG_FILE")
+    fi
+    
+    # 尝试删除配置目录（如果为空）
+    if [ -d "$config_dir" ]; then
+        rmdir "$config_dir" 2>/dev/null && deleted_files+=("配置目录: $config_dir")
+    fi
+    
+    if [ ${#deleted_files[@]} -gt 0 ]; then
+        echo "✅ 已删除以下文件:"
+        for file in "${deleted_files[@]}"; do
+            echo "  - $file"
+        done
+    else
+        echo "⚠️ 未找到配置文件或日志文件"
+    fi
+}
+
 # 读取或创建配置
 init_config() {
     create_config_dir
+
+    usage() {
+        echo "Cloudflare DDNS 更新脚本"
+        echo "版本: 统一配置版 (支持删除旧配置)"
+        echo
+        echo "用法:"
+        echo "  $0 [选项]"
+        echo
+        echo "选项:"
+        echo "  -h, --help            显示此帮助信息"
+        echo "  -delete      删除所有配置和日志文件"
+        echo "  -reconfig         重置配置文件并重新配置"
+        echo
+        echo "示例:"
+        echo "  $0                    正常执行DDNS更新"
+        echo "  $0 -delete    完全移除配置"
+        echo "  $0 -reconfig      重置配置文件"
+        echo
+        echo "说明:"
+        echo "  - 首次运行会自动进入配置向导"
+        echo "  - 配置存储在 $CFG_DIR"
+        echo "  - 日常使用无需添加参数直接运行即可"
+    }
+    
+    # 处理命令行选项
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -delete)
+            delete_config
+            exit 0
+            ;;
+        -reconfig)
+            if [ -f "$CONFIG_FILE" ]; then
+                rm -f "$CONFIG_FILE"
+                echo "✅ 配置已重置"
+                echo "请重新运行脚本进行配置"
+                exit 0
+            else
+                echo "配置文件不存在，无需重置"
+                exit 0
+            fi
+            ;;
+    esac
     
     if [ -f "$CONFIG_FILE" ]; then
         # 加载现有配置
@@ -153,7 +232,7 @@ cf_api_request() {
 # 主函数
 main() {
     # 初始化配置
-    init_config
+    init_config "$@"
     
     # 记录操作开始
     log "===== DDNS 更新开始 ($RECORD_NAME) ====="
@@ -240,14 +319,17 @@ main() {
 }
 
 # 检查jq依赖
-if ! command -v jq &> /dev/null; then
-    echo "❌ 错误：本脚本需要 jq 工具来处理JSON数据"
-    echo "请安装 jq:"
-    echo "  Ubuntu/Debian: sudo apt install jq"
-    echo "  CentOS/RHEL: sudo yum install jq"
-    echo "  macOS: brew install jq"
-    exit 1
-fi
+check_jq() {
+    if ! command -v jq &> /dev/null; then
+        echo "❌ 错误：需要jq工具但未安装"
+        echo "请安装jq:"
+        echo "  Ubuntu/Debian: sudo apt install jq"
+        echo "  CentOS/RHEL: sudo yum install jq"
+        echo "  macOS: brew install jq"
+        exit 1
+    fi
+}
 
-# 执行主函数
-main
+# 主程序入口
+check_jq
+main "$@"

@@ -28,6 +28,9 @@
 下次运行脚本将自动使用这些配置
 ══════════════════════════════════════════════════
 
+<img width="698" height="322" alt="test" src="https://github.com/user-attachments/assets/b521c76c-de01-424a-9061-43f0a8bb4c31" />
+
+
 
 ### 1. 安装必要依赖
 

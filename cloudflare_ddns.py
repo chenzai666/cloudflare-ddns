@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Cloudflare DDNS 更新脚本 (Python跨平台版)
-新增配置文件重新配置、删除功能
+新增配置文件删除功能
 """
 
 import os
@@ -367,7 +367,7 @@ def delete():
 if __name__ == "__main__":
     # 命令行参数解析
     parser = argparse.ArgumentParser(description='Cloudflare DDNS 更新脚本')
-    parser.add_argument('-reconfig', action='store_true', help='重新配置参数')
+    parser.add_argument('-reconfig', action='store_true', help='重置配置文件并重新配置')
     parser.add_argument('-delete', action='store_true', help='删除所有配置文件和日志')
     args = parser.parse_args()
     

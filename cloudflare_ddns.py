@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Cloudflare DDNS 更新脚本 (Python跨平台版)
-修复Windows编码问题，增强日志兼容性
+新增配置文件重新配置、删除功能
 """
 
 import os
@@ -126,7 +126,11 @@ class CloudflareDDNS:
         config["RECORD_NAME"] = input(f"3. 请输入要更新的域名 (默认: {default_name}): ").strip() or default_name
         
         default_type = DEFAULT_CONFIG["RECORD_TYPE"]
-        config["RECORD_TYPE"] = input(f"4. 记录类型 [A/AAAA] (默认: {default_type}): ").strip() or default_type
+        type_input = input(f"4. 记录类型 [A/AAAA] (默认: {default_type}): ").strip()
+        config["RECORD_TYPE"] = type_input if type_input else default_type
+        if config["RECORD_TYPE"] not in ["A", "AAAA"]:
+            print(f"错误: 不支持的记录类型 '{config['RECORD_TYPE']}', 请使用 A 或 AAAA")
+            sys.exit(1)
         
         default_ttl = DEFAULT_CONFIG["TTL"]
         ttl_input = input(f"5. TTL值 [1-86400] (默认: {default_ttl}): ").strip()
@@ -179,16 +183,8 @@ class CloudflareDDNS:
             self.error_symbol = "❌"
             self.warning_symbol = "⚠️"
         
-        # 控制台处理器 - 使用安全的编码处理
+        # 控制台处理器
         console_handler = logging.StreamHandler()
-        try:
-            # 尝试设置控制台编码为UTF-8
-            if sys.stdout.encoding != 'utf-8':
-                import io
-                sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-        except:
-            pass
-        
         console_handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(message)s', 
             '%H:%M:%S'
@@ -343,14 +339,51 @@ class CloudflareDDNS:
             self.logger.error("===== DDNS 更新失败 =====")
             return False
 
+def delete():
+    """删除配置文件和日志文件"""
+    deleted_files = []
+    
+    # 删除配置文件
+    if CFG_FILE.exists():
+        CFG_FILE.unlink()
+        deleted_files.append(f"配置文件: {CFG_FILE}")
+    
+    # 删除日志文件（如果存在）
+    log_file = CFG_DIR / "cloudflare_ddns.log"
+    if log_file.exists():
+        log_file.unlink()
+        deleted_files.append(f"日志文件: {log_file}")
+    
+    # 删除整个配置目录（如果为空）
+    try:
+        if CFG_DIR.exists() and not any(CFG_DIR.iterdir()):
+            CFG_DIR.rmdir()
+            deleted_files.append(f"配置目录: {CFG_DIR}")
+    except OSError:
+        pass
+    
+    return deleted_files
+
 if __name__ == "__main__":
     # 命令行参数解析
     parser = argparse.ArgumentParser(description='Cloudflare DDNS 更新脚本')
-    parser.add_argument('--reconfigure', action='store_true', help='重新配置参数')
+    parser.add_argument('-reconfig', action='store_true', help='重新配置参数')
+    parser.add_argument('-delete', action='store_true', help='删除所有配置文件和日志')
     args = parser.parse_args()
     
+    # 删除配置选项
+    if args.delete:
+        deleted = delete()
+        if deleted:
+            print("✅ 已删除以下文件:")
+            for file in deleted:
+                print(f"  - {file}")
+        else:
+            print("⚠️ 未找到配置文件或日志文件")
+        sys.exit()
+    
     # 重新配置选项
-    if args.reconfigure:
+    if args.reconfig:
         if CFG_FILE.exists():
             CFG_FILE.unlink()
             print("✅ 配置已重置")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Cloudflare DDNS 更新脚本 (Python跨平台版)
-新增配置文件删除功能
+新增 MTR 动态路由网关探测 & 可选目标配置功能
 """
 
 import os
@@ -11,6 +11,7 @@ import logging
 import argparse
 import subprocess
 import importlib.util
+import re
 from pathlib import Path
 from datetime import datetime
 
@@ -19,7 +20,9 @@ CFG_DIR = Path.home() / ".cloudflare_ddns"
 CFG_FILE = CFG_DIR / "config.json"
 LOG_FILE = CFG_DIR / "cloudflare_ddns.log"
 
-# 检查并安装依赖
+# ==========================================
+# 环境依赖自动准备区
+# ==========================================
 def check_dependencies():
     """确保必要的依赖已安装"""
     required = {'requests'}
@@ -27,13 +30,17 @@ def check_dependencies():
     
     for module in required:
         if importlib.util.find_spec(module) is None:
-            print(f"缺少必要模块: {module}")
+            print(f"⏳ 缺少必要模块: {module}")
             
-            # 尝试使用pip安装
+            # 尝试使用pip安装 (加入强制绕过系统环境限制和清华源)
             python_exe = sys.executable
-            pip_cmd = [python_exe, '-m', 'pip', 'install', module]
+            pip_cmd = [
+                python_exe, '-m', 'pip', 'install', module, 
+                '--break-system-packages', 
+                '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'
+            ]
             
-            print(f"正在尝试安装 {module}...")
+            print(f"正在尝试强制安装 {module}...")
             try:
                 subprocess.check_call(pip_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 print(f"✅ {module} 安装成功")
@@ -51,24 +58,37 @@ def check_dependencies():
                 print("1. 首先安装pip:")
                 print("   Ubuntu/Debian: sudo apt install python3-pip")
                 print("   CentOS/RHEL: sudo yum install python3-pip")
-                print("   Windows: python -m ensurepip")
                 print("2. 然后手动安装依赖:")
-                print(f"   pip install {module}")
+                print(f"   pip install {module} --break-system-packages")
                 print("="*50)
                 print("\n")
     
     # 再次检查所有依赖是否安装成功
     if not all(importlib.util.find_spec(m) for m in required):
         print("❌ 依赖安装失败，请手动安装必要的Python模块")
-        print("   运行: pip install requests")
         sys.exit(1)
+
+def check_mtr_tool():
+    """检查并自动安装 mtr 工具 (仅限 Linux)"""
+    if sys.platform.startswith('linux'):
+        if subprocess.call("command -v mtr", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+            print("⏳ 未检测到 mtr 工具，正在通过 apt 自动为您安装...")
+            try:
+                subprocess.check_call("apt-get update && apt-get install mtr -y", shell=True, stdout=subprocess.DEVNULL)
+                print("✅ mtr 工具安装完成！")
+            except Exception as e:
+                print(f"⚠️ mtr 自动安装失败，请稍后手动执行: sudo apt install mtr -y")
 
 # 在脚本开头检查依赖
 check_dependencies()
+check_mtr_tool()
 
 # 导入已确认安装的模块
 import requests
 
+# ==========================================
+# 核心逻辑区
+# ==========================================
 # 配置模板
 DEFAULT_CONFIG = {
     "API_TOKEN": "",
@@ -76,7 +96,8 @@ DEFAULT_CONFIG = {
     "RECORD_NAME": "ddns.example.com",
     "RECORD_TYPE": "A",
     "TTL": 60,
-    "LOG_FILE": str(LOG_FILE)
+    "LOG_FILE": str(LOG_FILE),
+    "MTR_TARGET": ""  # 新增配置项：MTR探测目标地址
 }
 
 class CloudflareDDNS:
@@ -95,6 +116,10 @@ class CloudflareDDNS:
                     # 验证必要配置
                     if not config.get("API_TOKEN") or not config.get("ZONE_ID"):
                         raise ValueError("缺少必要配置")
+                    
+                    # 兼容旧版本配置文件，如果没有 MTR_TARGET 则设置为空
+                    if "MTR_TARGET" not in config:
+                        config["MTR_TARGET"] = ""
                     return config
             except Exception as e:
                 print(f"配置文件损坏: {e}")
@@ -139,6 +164,10 @@ class CloudflareDDNS:
         default_log = str(LOG_FILE)
         log_input = input(f"6. 日志文件路径 (默认: {default_log}): ").strip() or default_log
         config["LOG_FILE"] = log_input
+
+        # 新增 MTR 目标配置
+        mtr_input = input("7. [高级选项] MTR探测目标地址 (留空则默认获取本机常规外网出口IP，输入如 dix.yiandrive.com 则获取第一跳网关IP): ").strip()
+        config["MTR_TARGET"] = mtr_input
         
         # 保存配置
         with open(CFG_FILE, 'w') as f:
@@ -170,8 +199,6 @@ class CloudflareDDNS:
         ))
         self.logger.addHandler(file_handler)
         
-        # ASCII字符替代方案（Windows兼容）
-        # 在Windows上使用纯ASCII字符，其他平台使用Unicode符号
         if sys.platform.startswith('win'):
             self.success_symbol = "[成功]"
             self.refresh_symbol = "=>"
@@ -192,33 +219,66 @@ class CloudflareDDNS:
         self.logger.addHandler(console_handler)
     
     def get_public_ip(self):
-        """获取当前公网IP"""
-        services = {
-            "A": [
+        """获取当前公网IP (根据配置选择 MTR 路由获取 或 常规 API 获取)"""
+        record_type = self.config["RECORD_TYPE"]
+        mtr_target = self.config.get("MTR_TARGET", "").strip()
+        
+        if record_type == "A":
+            # 如果配置了 MTR_TARGET，则尝试通过路由网关抓取
+            if mtr_target:
+                self.logger.info(f"🔍 正在通过 MTR 探测 [{mtr_target}] 的入口/网关 IP...")
+                try:
+                    cmd = f"mtr -rw -c 1 {mtr_target} | awk 'NR==3 {{print $2}}'"
+                    result = subprocess.check_output(cmd, shell=True).decode().strip()
+                    
+                    # 验证是否抓取到有效的 IPv4 地址 (去除113限制)
+                    if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", result):
+                        self.logger.info(f"🎯 成功定位到网关/入口 IP: {result}")
+                        return result
+                    else:
+                        self.logger.warning(f"{self.warning_symbol} MTR 未抓到有效 IP (当前: {result})，降级使用常规接口...")
+                except Exception as e:
+                    self.logger.error(f"{self.error_symbol} MTR 探测出错: {e}，降级使用常规接口...")
+            else:
+                self.logger.info("🔍 未配置 MTR 探测目标，默认获取本机外网出口 IP...")
+
+            # 常规/备用 IPv4 接口池
+            ipv4_services = [
+                "http://txt.go.sohu.com/ip/sohu",
                 "https://api.ipify.org",
-                "https://ipv4.icanhazip.com",
-                "https://checkip.amazonaws.com"
-            ],
-            "AAAA": [
+                "https://ipv4.icanhazip.com"
+            ]
+            
+            for service in ipv4_services:
+                try:
+                    response = requests.get(service, timeout=10)
+                    response.raise_for_status()
+                    ip_match = re.search(r'\d+\.\d+\.\d+\.\d+', response.text)
+                    if ip_match:
+                        ip = ip_match.group()
+                        self.logger.info(f"获取到公网IP: {ip} (来自 {service})")
+                        return ip
+                except Exception as e:
+                    self.logger.debug(f"IP服务 {service} 失败: {str(e)}")
+                    continue
+                    
+        elif record_type == "AAAA":
+            ipv6_services = [
                 "https://api6.ipify.org",
                 "https://ipv6.icanhazip.com",
                 "https://v6.ident.me"
             ]
-        }
-        
-        record_type = self.config["RECORD_TYPE"]
-        for service in services[record_type]:
-            try:
-                response = requests.get(service, timeout=10)
-                response.raise_for_status()
-                ip = response.text.strip()
-                if ip:
-                    self.logger.info(f"获取到公网IP: {ip}")
-                    return ip
-            except Exception as e:
-                self.logger.debug(f"IP服务 {service} 失败: {str(e)}")
-                continue
-        
+            for service in ipv6_services:
+                try:
+                    response = requests.get(service, timeout=10)
+                    response.raise_for_status()
+                    ip = response.text.strip()
+                    if ip:
+                        self.logger.info(f"获取到IPv6: {ip}")
+                        return ip
+                except Exception as e:
+                    continue
+
         self.logger.error("所有IP服务均失败，无法获取公网IP地址")
         return None
     
@@ -245,7 +305,6 @@ class CloudflareDDNS:
                 
         except requests.exceptions.RequestException as e:
             error_msg = str(e)
-            # 提取JSON错误信息（如果存在）
             try:
                 error_resp = e.response.json()
                 if "errors" in error_resp:
@@ -258,7 +317,7 @@ class CloudflareDDNS:
             return {"success": False, "errors": [{"message": error_msg}]}
     
     def update_dns(self):
-        """主更新逻辑 - 使用平台相关符号"""
+        """主更新逻辑"""
         self.logger.info(f"===== DDNS 更新开始 ({self.config['RECORD_NAME']}) =====")
         
         # 获取当前IP
@@ -313,7 +372,7 @@ class CloudflareDDNS:
         
         # 检查IP是否变化
         if existing_ip == current_ip:
-            self.logger.info(f"{self.refresh_symbol} IP地址未变化，无需更新")
+            self.logger.info(f"{self.refresh_symbol} IP地址未变化 ({existing_ip})，无需更新")
             self.logger.info("===== DDNS 更新完成 =====")
             return True
         
@@ -343,18 +402,15 @@ def delete():
     """删除配置文件和日志文件"""
     deleted_files = []
     
-    # 删除配置文件
     if CFG_FILE.exists():
         CFG_FILE.unlink()
         deleted_files.append(f"配置文件: {CFG_FILE}")
     
-    # 删除日志文件（如果存在）
     log_file = CFG_DIR / "cloudflare_ddns.log"
     if log_file.exists():
         log_file.unlink()
         deleted_files.append(f"日志文件: {log_file}")
     
-    # 删除整个配置目录（如果为空）
     try:
         if CFG_DIR.exists() and not any(CFG_DIR.iterdir()):
             CFG_DIR.rmdir()
@@ -400,6 +456,5 @@ if __name__ == "__main__":
         print("\n操作已取消")
         sys.exit(1)
     except Exception as e:
-        # 使用简单的日志记录避免编码问题
         print(f"程序异常: {str(e)}")
         sys.exit(1)

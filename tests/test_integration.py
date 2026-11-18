@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import Mock, mock_open, patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -60,15 +60,35 @@ class RecordCommandsTest(unittest.TestCase):
 
         self.assertTrue(self.command(["sync", "--dry-run"], api))
         self.assertEqual(writes, [])
+        self.assertIn("同步源：home.example.org (A) = 192.0.2.9", self.output.getvalue())
         for name in ("one.example.org", "two.example.org"):
             self.assertIn(name, self.output.getvalue())
         self.assertFalse(self.command(["sync"], api))
         self.assertEqual(writes, ["a", "b"])
+        self.assertIn("成功 1，失败 1", self.output.getvalue())
         fail = False
         self.assertTrue(self.command(["sync"], api))
         self.assertTrue(self.command(["sync"], api))
         self.assertEqual(writes, ["a", "b", "a"])
         self.get_ip.assert_not_called()
+
+    def test_confirm_uses_displayed_plan_and_does_not_ask_on_no_changes(self):
+        source = record("s", "home", "192.0.2.9")
+        target = record("a", "one")
+        api = Mock(side_effect=[
+            {"success": True, "result": [source]},
+            {"success": True, "result": [source, target]},
+            {"success": True},
+            {"success": True, "result": [source]},
+            {"success": True, "result": [source]},
+        ])
+        with patch("builtins.input", return_value="y") as confirm:
+            self.assertTrue(self.command(["sync", "--confirm"], api))
+            confirm.assert_called_once()
+            self.assertTrue(self.command(["sync", "--confirm"], api))
+            confirm.assert_called_once()
+        self.assertEqual([call.args[0] for call in api.call_args_list], ["GET", "GET", "PATCH", "GET", "GET"])
+        self.assertIn("无需同步", self.output.getvalue())
 
     def test_later_page_failure_aborts_before_first_write(self):
         api = Mock(side_effect=[
@@ -123,14 +143,18 @@ class UnifiedEntryTest(unittest.TestCase):
             "*/10 * * * * /usr/bin/python3 /old/ddns.py ddns # cloudflare-ddns:python\n"
             "0 3 * * * /usr/bin/python3 /old/ddns.py clean-logs # cloudflare-ddns:python-logs\n"
         )
-        with patch.object(subprocess, "run") as invoke, redirect_stdout(io.StringIO()):
+        with patch.object(subprocess, "run") as invoke, redirect_stdout(io.StringIO()), \
+                patch.object(cloudflare_ddns, "LOG_FILE", PurePosixPath("/home/cron test%/.cloudflare_ddns/cloudflare_ddns.log")):
             invoke.return_value = subprocess.CompletedProcess([], 0, stdout=original, stderr="")
             cloudflare_ddns._cron_schedule("60", ["/usr/bin/python3", "/opt/A B%/ddns.py"])
             command, write = invoke.call_args
             self.assertEqual(command[0], ["crontab", "-"])
             self.assertEqual(write["input"], original[:original.rindex("*/10")] +
-                             "0 * * * * /usr/bin/python3 '/opt/A B\\%/ddns.py' ddns # cloudflare-ddns:python\n"
+                             "0 * * * * umask 077; /usr/bin/python3 '/opt/A B\\%/ddns.py' ddns "
+                             ">> '/home/cron test\\%/.cloudflare_ddns/cloudflare_ddns.log' 2>&1 # cloudflare-ddns:python\n"
                              "0 3 * * * /usr/bin/python3 '/opt/A B\\%/ddns.py' clean-logs # cloudflare-ddns:python-logs\n")
+            cloudflare_ddns._cron_schedule("5", ["/usr/bin/python3", "/opt/ddns.py"], sync_others=True)
+            self.assertIn("ddns --sync-others >> ", invoke.call_args.kwargs["input"])
             cloudflare_ddns._cron_schedule("off", [])
             self.assertEqual(invoke.call_args.kwargs["input"], original[:original.rindex("*/10")])
 
@@ -146,21 +170,23 @@ class UnifiedEntryTest(unittest.TestCase):
             folder = Path(directory)
             config = folder / "config.json"
             log = folder / "ddns.log"
+            legacy_log = folder / "legacy.log"
             old = folder / "ddns.log.ddns-python-20200101-030000-000000"
             recent = folder / "ddns.log.ddns-python-20200102-030000-000000"
             unrelated = folder / "ddns.log.ddns-sh-20200101-030000"
-            config.write_text(json.dumps({"LOG_FILE": str(log)}), encoding="utf-8")
-            for path in (log, old, recent, unrelated):
+            config.write_text(json.dumps({"LOG_FILE": str(legacy_log)}), encoding="utf-8")
+            for path in (log, legacy_log, old, recent, unrelated):
                 path.write_text(path.name, encoding="utf-8")
             stale = time.time() - 8 * 24 * 60 * 60
             os.utime(old, (stale, stale))
             os.utime(unrelated, (stale, stale))
-            with patch.object(cloudflare_ddns, "CFG_FILE", config):
+            with patch.object(cloudflare_ddns, "CFG_FILE", config), patch.object(cloudflare_ddns, "LOG_FILE", log):
                 cloudflare_ddns.clean_logs()
             self.assertFalse(log.exists())
             self.assertFalse(old.exists())
             self.assertTrue(recent.exists())
             self.assertTrue(unrelated.exists())
+            self.assertTrue(legacy_log.exists())
             archived = set(folder.glob("ddns.log.ddns-python-*")) - {recent}
             self.assertEqual(len(archived), 1)
             self.assertEqual(archived.pop().read_text(encoding="utf-8"), log.name)
@@ -169,12 +195,41 @@ class UnifiedEntryTest(unittest.TestCase):
         with patch.object(cloudflare_ddns.sys, "platform", "win32"), \
                 patch.object(Path, "exists", return_value=True), \
                 patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as invoke:
-            cloudflare_ddns.schedule("5")
+            cloudflare_ddns.schedule("5", sync_others=True)
         update, cleanup = [item.args[0] for item in invoke.call_args_list]
         self.assertIn("MINUTE", update)
         self.assertIn("DAILY", cleanup)
-        self.assertTrue(update[update.index("/TR") + 1].endswith(" ddns"))
+        task = update[update.index("/TR") + 1]
+        self.assertIn(" ddns --log-file ", task)
+        self.assertIn("cloudflare_ddns.log", task)
+        self.assertTrue(task.endswith(" --sync-others"))
         self.assertTrue(cleanup[cleanup.index("/TR") + 1].endswith(" clean-logs"))
+
+    def test_legacy_log_setting_does_not_create_a_file(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stderr(io.StringIO()) as output:
+            legacy_log = Path(directory) / "legacy.log"
+            client = cloudflare_ddns.CloudflareDDNS({"LOG_FILE": str(legacy_log)})
+            client.logger.info("手动运行")
+            self.assertIn("手动运行", output.getvalue())
+            self.assertFalse(legacy_log.exists())
+
+    def test_explicit_log_file_collects_output(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(cloudflare_ddns, "_update_ddns") as update:
+            log = Path(directory) / "cloudflare_ddns.log"
+            update.side_effect = lambda _scope: print("纪录一次更新") or True
+            self.assertEqual(cloudflare_ddns.main(["ddns", "--log-file", str(log)]), 0)
+            self.assertIn("纪录一次更新", log.read_text(encoding="utf-8"))
+
+    def test_ddns_sync_reuses_same_client_and_aborts_on_source_failure(self):
+        with patch.object(cloudflare_ddns, "CloudflareDDNS") as factory, \
+                patch.object(cloudflare_ddns, "_sync", return_value=True) as sync:
+            client = factory.return_value
+            client.update_dns.side_effect = [False, True]
+            client.current_ip = "192.0.2.9"
+            self.assertEqual(cloudflare_ddns.main(["ddns", "--sync-others"]), 1)
+            sync.assert_not_called()
+            self.assertEqual(cloudflare_ddns.main(["ddns", "--sync-others"]), 0)
+            sync.assert_called_once_with(client.config, client.cf_api_request, source_ip="192.0.2.9")
 
     def test_ddns_corrects_remote_change_and_preserves_proxy(self):
         config = {"RECORD_TYPE": "A", "RECORD_NAME": "home.example.org", "TTL": 60}

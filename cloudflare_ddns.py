@@ -10,6 +10,7 @@ import subprocess
 import shlex
 import tempfile
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 import ipaddress
 from getpass import getpass
@@ -33,7 +34,6 @@ DEFAULT_CONFIG = {
     "RECORD_NAME": "ddns.example.com",
     "RECORD_TYPE": "A",
     "TTL": 60,
-    "LOG_FILE": str(LOG_FILE),
     "MTR_TARGET": ""  # 新增配置项：MTR探测目标地址
 }
 
@@ -109,10 +109,7 @@ class CloudflareDDNS:
         return config
 
     def setup_logging(self):
-        """配置日志系统 - 解决Windows编码问题"""
-        log_path = Path(self.config["LOG_FILE"])
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        
+        """将运行信息输出到终端，日志文件由调用方指定。"""
         self.logger = logging.getLogger("CloudflareDDNS")
         self.logger.setLevel(logging.INFO)
         
@@ -120,14 +117,6 @@ class CloudflareDDNS:
         for handler in self.logger.handlers[:]:
             self.logger.removeHandler(handler)
             handler.close()
-        
-        # 日志文件处理器 - 使用UTF-8编码
-        file_handler = logging.FileHandler(log_path, encoding='utf-8')
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s', 
-            datefmt='%Y-%m-%d %H:%M:%S'
-        ))
-        self.logger.addHandler(file_handler)
         
         if sys.platform.startswith('win'):
             self.success_symbol = "[成功]"
@@ -239,6 +228,7 @@ class CloudflareDDNS:
         if not current_ip:
             self.logger.error("===== DDNS 更新失败 =====")
             return False
+        self.current_ip = current_ip
         
         # 查询现有DNS记录
         query = "dns_records?" + urlencode({"name": self.config["RECORD_NAME"], "type": self.config["RECORD_TYPE"]})
@@ -360,7 +350,9 @@ def register_commands(subparsers):
 
     sync = subparsers.add_parser("sync", help="将区域内未代理的同类型地址记录对齐到 DDNS 记录")
     sync.add_argument("--type", choices=("A", "AAAA"), help="指定源记录类型")
-    sync.add_argument("--dry-run", action="store_true", help="列出预计变更")
+    mode = sync.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="列出预计变更")
+    mode.add_argument("--confirm", action="store_true", help="预览后确认执行")
 
 
 def _name(value, wildcard=False):
@@ -451,37 +443,53 @@ def _endpoint(record):
     return "dns_records/" + quote(record["id"], safe="")
 
 
-def _sync(args, config, api):
+def _sync(config, api, *, kind=None, dry_run=False, confirm=False, source_ip=None):
     name = _name(config["RECORD_NAME"])
-    kind = args.type or config.get("RECORD_TYPE")
-    source = _lookup(api, name, kind)
-    if not source or source["type"] not in ("A", "AAAA"):
-        raise ValueError(f"未找到可用的 A/AAAA 源记录 {name}")
-    kind = source["type"]
-    address = _content(source["content"], kind)
+    kind = kind or config.get("RECORD_TYPE")
+    if source_ip is None:
+        source = _lookup(api, name, kind)
+        if not source or source["type"] not in ("A", "AAAA"):
+            raise ValueError(f"未找到可用的 A/AAAA 源记录 {name}")
+        kind = source["type"]
+        source_ip = source["content"]
+    address = _content(source_ip, kind)
+    zone = config.get("BASE_DOMAIN") or config.get("ZONE_ID")
+    if zone:
+        print(f"区域：{zone}")
+    print(f"同步源：{name} ({kind}) = {address}")
     changes = []
     for r in _records(api, type=kind):
         if (r["type"] == kind and r["name"].lower().rstrip(".") != name
                 and r["proxied"] is False and _content(r["content"], kind) != address):
             changes.append((_endpoint(r), r["name"], r["content"]))
-    success = True
+    if not changes:
+        print("无需同步：没有要修改的记录。")
+        return True
+    print(f"待变更记录数：{len(changes)}")
+    for _, domain, previous in changes:
+        print(f"  {domain} ({kind})  {previous} → {address}")
+    if dry_run:
+        return True
+    if confirm and input("确认只同步以上记录？[y/N]：").strip().lower() != "y":
+        print("已取消同步")
+        return True
+    updated = 0
     for endpoint, domain, previous in changes:
-        print(f"{domain} ({kind})  {previous} → {address}")
-        if not args.dry_run:
-            try:
-                _request(api, "PATCH", endpoint, {"content": address})
-            except (OSError, ValueError) as error:
-                print(error, file=sys.stderr)
-                success = False
-    print(f"待变更记录数：{len(changes)}" if args.dry_run else f"本次匹配的变更数：{len(changes)}")
-    return success
+        try:
+            _request(api, "PATCH", endpoint, {"content": address})
+            print(f"已更新：{domain} ({kind})  {previous} → {address}")
+            updated += 1
+        except (OSError, ValueError) as error:
+            print(f"更新失败：{domain} ({kind})，{error}", file=sys.stderr)
+    print(f"同步结果：成功 {updated}，失败 {len(changes) - updated}")
+    return updated == len(changes)
 
 
 def run(args, config, api, get_ip):
     """执行已解析的命令，返回所有请求是否成功。"""
     try:
         if args.command == "sync":
-            return _sync(args, config, api)
+            return _sync(config, api, kind=args.type, dry_run=args.dry_run, confirm=args.confirm)
         base = _name(config.get("BASE_DOMAIN"))
         name = base if args.prefix == "@" else _name(f"{args.prefix}.{base}", wildcard=True)
         record = _lookup(api, name, args.type)
@@ -538,9 +546,6 @@ def load_manager_config():
     if path == MANAGER_FILE:
         config["RECORD_NAME"] = config.get("DDNS_RECORD")
         config.setdefault("DEFAULT_TTL", "auto")
-        config.setdefault("LOG_FILE", str(path.with_name("cf_dns_manager.log")))
-    else:
-        config.setdefault("LOG_FILE", str(LOG_FILE))
     return config
 
 
@@ -550,8 +555,7 @@ WINDOWS_TASK = r"\Cloudflare-DDNS-Python"
 
 def clean_logs():
     """轮转 DDNS 日志，清理七天前由本脚本生成的日志归档。"""
-    with CFG_FILE.open(encoding="utf-8") as f:
-        log = Path(json.load(f).get("LOG_FILE") or LOG_FILE)
+    log = LOG_FILE
     prefix = log.name + ".ddns-python-"
     if log.is_file() and not log.is_symlink() and log.stat().st_size:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -566,7 +570,7 @@ def clean_logs():
             archive.unlink()
 
 
-def _cron_schedule(action, command):
+def _cron_schedule(action, command, sync_others=False):
     env = dict(os.environ, LC_ALL="C")
     current = subprocess.run(["crontab", "-l"], capture_output=True, text=True, env=env)
     if current.returncode:
@@ -587,20 +591,27 @@ def _cron_schedule(action, command):
         return
     table = "".join(line for line in lines if line not in owned)
     if action != "off":
-        if any("\n" in arg or "\r" in arg for arg in command):
-            raise ValueError("脚本路径不能包含换行")
+        if any("\n" in arg or "\r" in arg for arg in [*command, str(LOG_FILE)]):
+            raise ValueError("脚本或日志路径不能包含换行")
         line = " ".join(shlex.quote(arg) for arg in command).replace("%", r"\%")
+        log_arg = shlex.quote(str(LOG_FILE)).replace("%", r"\%")
         timing = "0 * * * *" if action == "60" else f"*/{action} * * * *"
         if table and not table.endswith("\n"):
             table += "\n"
-        table += f"{timing} {line} ddns {CRON_MARKER}\n"
+        flag = " --sync-others" if sync_others else ""
+        table += f"{timing} umask 077; {line} ddns{flag} >> {log_arg} 2>&1 {CRON_MARKER}\n"
         table += f"0 3 * * * {line} clean-logs {CRON_MARKER}-logs\n"
     subprocess.run(["crontab", "-"], input=table, text=True, env=env, check=True)
-    print("已删除两项定时任务" if action == "off"
-          else f"已设置每 {action} 分钟更新 DDNS，每天 03:00 轮转并清理日志")
+    if action == "off":
+        print("已删除两项定时任务")
+    else:
+        scope = "更新 DDNS 主记录后同步其他记录" if sync_others else "只更新 DDNS 主记录"
+        print(f"已设置每 {action} 分钟{scope}，每天 03:00 清理日志\n日志文件：{LOG_FILE}")
 
 
-def schedule(action):
+def schedule(action, sync_others=False):
+    if sync_others and action in ("status", "off"):
+        raise ValueError("--sync-others 仅用于设置间隔")
     if action not in ("status", "off"):
         if not action.isascii() or not action.isdecimal() or not 1 <= int(action) <= 60:
             raise ValueError("间隔请输入 1 到 60 分钟")
@@ -617,14 +628,30 @@ def schedule(action):
                 args = ["schtasks", "/Delete", "/TN", name, "/F"]
             else:
                 timing = ["/SC", "MINUTE", "/MO", action] if operation == "ddns" else ["/SC", "DAILY", "/ST", "03:00"]
+                task_command = command + [operation]
+                if operation == "ddns":
+                    task_command.extend(["--log-file", str(LOG_FILE)])
+                    if sync_others:
+                        task_command.append("--sync-others")
                 args = ["schtasks", "/Create", "/TN", name, *timing,
-                        "/TR", subprocess.list2cmdline(command + [operation]), "/IT", "/F"]
+                        "/TR", subprocess.list2cmdline(task_command), "/IT", "/F"]
             if subprocess.run(args).returncode:
                 failed.append(name)
         if failed:
             raise ValueError(f"以下任务操作未成功，请查看任务状态：{', '.join(failed)}")
+        if action not in ("status", "off"):
+            print(f"日志文件：{LOG_FILE}")
     else:
-        _cron_schedule(action, command)
+        _cron_schedule(action, command, sync_others)
+
+
+def _update_ddns(sync_others=False):
+    client = CloudflareDDNS()
+    if not client.update_dns():
+        return False
+    if sync_others:
+        return _sync(client.config, client.cf_api_request, source_ip=client.current_ip)
+    return True
 
 
 def _record_menu(command):
@@ -676,13 +703,24 @@ Cloudflare DDNS 与 DNS 管理
             elif choice == "6":
                 kind = input("源记录类型 A/AAAA（回车使用配置）：").strip().upper()
                 args = ["sync"] + (["--type", kind] if kind else [])
-                if main(args + ["--dry-run"]) == 0 and input("确认同步？[y/N]：").strip().lower() == "y":
-                    main(args)
+                main(args + ["--confirm"])
             elif choice == "7":
                 action = input("1 添加两项任务，2 删除两项任务，3 查看，0 返回：").strip()
                 if action == "1":
                     minutes = input("DDNS 执行间隔（分钟，默认 5）：").strip() or "5"
-                    schedule(minutes)
+                    scope = input("1 只更新 DDNS 主记录（默认），2 主记录成功后同步其他记录：").strip() or "1"
+                    if scope not in ("1", "2"):
+                        raise ValueError("请选 1 或 2")
+                    if scope == "2":
+                        if not CFG_FILE.exists():
+                            raise ValueError("请先完成 DDNS 配置")
+                        config = CloudflareDDNS.__new__(CloudflareDDNS).load_config()
+                        zone = config.get("BASE_DOMAIN") or config["ZONE_ID"]
+                        print(f"主记录：{config['RECORD_NAME']} ({config['RECORD_TYPE']})，区域：{zone}")
+                        approval = input("同时更新该区域内同类型、未开启代理的其他记录？[y/N]：")
+                        if approval.strip().lower() != "y":
+                            continue
+                    schedule(minutes, sync_others=scope == "2")
                 elif action == "2" and input("删除两项定时任务？[y/N]：").strip().lower() == "y":
                     schedule("off")
                 elif action == "3":
@@ -707,9 +745,12 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("menu", help="打开交互菜单")
     commands.add_parser("configure", help="创建或编辑 DDNS 配置")
-    commands.add_parser("ddns", help="更新 DDNS 主记录")
+    ddns = commands.add_parser("ddns", help="更新 DDNS 主记录")
+    ddns.add_argument("--log-file", type=Path, help="将此轮输出追加到指定文件")
+    ddns.add_argument("--sync-others", action="store_true", help="主记录更新成功后同步同区域其他记录")
     scheduler = commands.add_parser("schedule", help="查看、设置或取消 DDNS 定时任务")
     scheduler.add_argument("action", nargs="?", default="status", help="status、off 或间隔分钟数")
+    scheduler.add_argument("--sync-others", action="store_true", help="定时同步同区域其他同类型且未代理的记录")
     commands.add_parser("clean-logs", help="轮转日志并删除七天前的归档")
     register_commands(commands)
     args = parser.parse_args(argv)
@@ -728,7 +769,7 @@ def main(argv=None):
         if args.command == "menu" or (not argv and sys.stdin.isatty() and sys.stdout.isatty()):
             return menu()
         if args.command == "schedule":
-            schedule(args.action)
+            schedule(args.action, sync_others=args.sync_others)
             return 0
         if args.command == "clean-logs":
             clean_logs()
@@ -739,7 +780,16 @@ def main(argv=None):
             client.setup_wizard(existing)
             return 0
         if args.command in (None, "ddns"):
-            ok = CloudflareDDNS().update_dns()
+            sync_others = getattr(args, "sync_others", False)
+            log_file = getattr(args, "log_file", None)
+            if log_file is None:
+                ok = _update_ddns(sync_others)
+            else:
+                opener = lambda path, flags: os.open(path, flags, 0o600)
+                with open(log_file, "a", encoding="utf-8", opener=opener) as output:
+                    with redirect_stdout(output), redirect_stderr(output):
+                        command = ["ddns", "--sync-others"] if sync_others else ["ddns"]
+                        return main(command)
         else:
             config = load_manager_config()
             client = CloudflareDDNS(config)

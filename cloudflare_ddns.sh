@@ -11,19 +11,19 @@ CRON_MARKER='# cloudflare-ddns:sh'
 LOG_CRON_MARKER='# cloudflare-ddns:sh-logs'
 
 API_TOKEN='' ZONE_ID='' RECORD_NAME='' RECORD_TYPE='' TTL='' BASE_DOMAIN=''
-LOG_FILE="$DEFAULT_LOG" MTR_TARGET=''
+MTR_TARGET='' DDNS_IP=''
 
 usage() {
     cat <<'HELP'
 用法：bash cloudflare_ddns.sh [命令] [参数]
   menu                     打开交互菜单（终端内无参数时默认打开）
-  ddns                     更新 DDNS 主记录（非交互环境默认执行）
+  ddns [--sync-others]      更新 DDNS 主记录（非交互环境默认执行）
   configure                创建或修改配置
   add 前缀 [--type A|AAAA|CNAME] [--ip 地址] [--ttl auto|秒] [--proxied]
   update 前缀 [--type A|AAAA|CNAME] [--ip 地址] [--ttl auto|秒] [--proxied|--no-proxied]
   delete 前缀 [--type A|AAAA|CNAME]
   sync [--type A|AAAA] [--dry-run]
-  schedule [status|off|1–60]
+  schedule [status|off|1–60 [--sync-others]]
   clean-logs               轮转 SH 版日志，清理满 7 天的轮转文件
   -reconfig                清除 SH 配置，下次运行重新配置
   -delete                  清除 SH 配置和默认日志
@@ -39,12 +39,7 @@ fail() {
 }
 
 log() {
-    local line
-    line="$(date '+%Y-%m-%d %H:%M:%S') - $*"
-    printf '%s\n' "$line"
-    if [[ -n $LOG_FILE && -d $(dirname -- "$LOG_FILE") ]]; then
-        (umask 077; printf '%s\n' "$line" >> "$LOG_FILE") || return 1
-    fi
+    printf '%s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
 normalize_name() {
@@ -121,7 +116,7 @@ load_assignments() {
         [[ $line == *=* ]] || { fail "配置文件中有无效的配置行：$CONFIG_FILE"; return; }
         key="${line%%=*}" value="${line#*=}"
         case "$key" in
-            API_TOKEN|ZONE_ID|RECORD_NAME|RECORD_TYPE|TTL|BASE_DOMAIN|LOG_FILE|MTR_TARGET)
+            API_TOKEN|ZONE_ID|RECORD_NAME|RECORD_TYPE|TTL|BASE_DOMAIN|MTR_TARGET)
                 if [[ $value == \'*\' && ${#value} -ge 2 ]]; then
                     value="${value:1:${#value}-2}"
                 fi
@@ -135,7 +130,7 @@ load_json_config() {
     local file="$1" assignments key line
     assignments=$(jq -er '
         if type != "object" then error("配置应为 JSON 对象") else . end
-        | {API_TOKEN, ZONE_ID, BASE_DOMAIN, RECORD_TYPE, LOG_FILE, MTR_TARGET,
+        | {API_TOKEN, ZONE_ID, BASE_DOMAIN, RECORD_TYPE, MTR_TARGET,
            RECORD_NAME: (.DDNS_RECORD // .RECORD_NAME),
            TTL: (.DEFAULT_TTL // .TTL)}
         | to_entries[]
@@ -180,8 +175,6 @@ configure() {
     if [[ $BASE_DOMAIN ]]; then
         BASE_DOMAIN="$(normalize_name "$BASE_DOMAIN")" || { fail "区域域名无效"; return; }
     fi
-    read -r -p "日志路径 [$LOG_FILE]: " input || return 1
-    LOG_FILE="${input:-$LOG_FILE}"
     read -r -p "MTR 目标 [${MTR_TARGET:-跳过，输入 - 清除}]: " input || return 1
     MTR_TARGET="${input:-$MTR_TARGET}"
     [[ $MTR_TARGET != - ]] || MTR_TARGET=''
@@ -189,8 +182,8 @@ configure() {
     [[ $input == [yY] ]] || { printf '已取消保存。\n'; return 1; }
     (umask 077; mkdir -p -- "$CFG_DIR") || return 1
     temp=$(mktemp "$CFG_DIR/.config.XXXXXX") || return 1
-    if ! printf "API_TOKEN='%s'\nZONE_ID='%s'\nRECORD_NAME='%s'\nRECORD_TYPE='%s'\nTTL='%s'\nBASE_DOMAIN='%s'\nLOG_FILE='%s'\nMTR_TARGET='%s'\n" \
-        "$API_TOKEN" "$ZONE_ID" "$RECORD_NAME" "$RECORD_TYPE" "$TTL" "$BASE_DOMAIN" "$LOG_FILE" "$MTR_TARGET" > "$temp" ||
+    if ! printf "API_TOKEN='%s'\nZONE_ID='%s'\nRECORD_NAME='%s'\nRECORD_TYPE='%s'\nTTL='%s'\nBASE_DOMAIN='%s'\nMTR_TARGET='%s'\n" \
+        "$API_TOKEN" "$ZONE_ID" "$RECORD_NAME" "$RECORD_TYPE" "$TTL" "$BASE_DOMAIN" "$MTR_TARGET" > "$temp" ||
         ! mv -f -- "$temp" "$CONFIG_FILE"; then
         rm -f -- "$temp"
         return 1
@@ -317,11 +310,13 @@ ddns() {
     if [[ ! $record ]]; then
         payload=$(make_payload "$RECORD_TYPE" "$RECORD_NAME" "$ip" "$TTL" false) || return 1
         api POST dns_records "$payload" >/dev/null || return 1
+        DDNS_IP="$ip"
         log "已创建 $RECORD_NAME → $ip"
         return
     fi
     old=$(jq -er '.content' <<< "$record") || return 1
     if [[ $(normalize_ip "$RECORD_TYPE" "$old") == "$(normalize_ip "$RECORD_TYPE" "$ip")" ]]; then
+        DDNS_IP="$ip"
         log "$RECORD_NAME 地址未变 ($ip)"
         return
     fi
@@ -329,19 +324,24 @@ ddns() {
     payload=$(jq -c --arg content "$ip" --argjson ttl "$TTL" \
         'if .proxied == true then {$content} else {$content, $ttl} end' <<< "$record") || return 1
     api PATCH "dns_records/$id" "$payload" >/dev/null || return 1
+    DDNS_IP="$ip"
     log "已更新 $RECORD_NAME → $ip"
 }
 
 sync_records() {
-    local kind="$1" dry_run="$2" name source ip normalized rows row id previous value payload
-    local status=0 changes=0 succeeded=0
+    local kind="$1" mode="$2" ip="${3:-}" name source normalized rows row id previous value payload confirmed
+    local failed=0 succeeded=0
     local -a plan=()
     name=$(normalize_name "$RECORD_NAME" wildcard) || { fail "请配置 DDNS 源记录"; return; }
-    source=$(find_record "$name" "${kind:-$RECORD_TYPE}") || return 1
-    [[ $source ]] || { fail "未找到 DDNS 源记录 $name"; return; }
-    kind=$(jq -er '.type' <<< "$source") || return 1
-    ip=$(jq -er '.content' <<< "$source") || return 1
+    if [[ ! $ip ]]; then
+        source=$(find_record "$name" "${kind:-$RECORD_TYPE}") || return 1
+        [[ $source ]] || { fail "未找到 DDNS 源记录 $name"; return; }
+        kind=$(jq -er '.type' <<< "$source") || return 1
+        ip=$(jq -er '.content' <<< "$source") || return 1
+    fi
     normalized=$(normalize_ip "$kind" "$ip") || { fail "源记录须为有效的 A 或 AAAA 地址"; return; }
+    printf '区域：%s\n' "${BASE_DOMAIN:-$ZONE_ID}"
+    printf 'DDNS 源记录：%s (%s) → %s\n' "$name" "$kind" "$ip"
     rows=$(list_records '' "$kind") || return 1
     rows=$(jq -c --arg name "$name" --arg kind "$kind" '
         select(.type == $kind and (.name | ascii_downcase | rtrimstr(".")) != $name and .proxied == false)' <<< "$rows") || return 1
@@ -354,23 +354,35 @@ sync_records() {
             plan+=("$row")
         fi
     done <<< "$rows"
-    payload=$(jq -nc --arg content "$ip" '{$content}') || return 1
+    if (( ${#plan[@]} == 0 )); then
+        printf '没有需要更新的记录。本次未写入 Cloudflare。\n'
+        return 0
+    fi
     for row in "${plan[@]}"; do
         name=$(jq -er '.name' <<< "$row") || return 1
         previous=$(jq -er '.content' <<< "$row") || return 1
-        id=$(record_id "$row") || return 1
         printf '%s (%s)  %s → %s\n' "$name" "$kind" "$previous" "$ip"
-        ((changes+=1))
-        if [[ $dry_run != true ]]; then
-            if api PATCH "dns_records/$id" "$payload" >/dev/null; then ((succeeded+=1)); else status=1; fi
+    done
+    printf '待变更记录数：%s\n' "${#plan[@]}"
+    [[ $mode != preview ]] || return 0
+    if [[ $mode == confirm ]]; then
+        read -r -p '执行以上批量同步？[y/N]: ' confirmed || return 0
+        [[ $confirmed == [yY] ]] || { printf '已取消同步。\n'; return 0; }
+    fi
+    payload=$(jq -nc --arg content "$ip" '{$content}') || return 1
+    for row in "${plan[@]}"; do
+        name=$(jq -er '.name' <<< "$row") || return 1
+        id=$(record_id "$row") || return 1
+        if api PATCH "dns_records/$id" "$payload" >/dev/null; then
+            printf '更新成功：%s\n' "$name"
+            ((succeeded+=1))
+        else
+            printf '更新失败：%s\n' "$name" >&2
+            ((failed+=1))
         fi
     done
-    if [[ $dry_run == true ]]; then
-        printf '待变更记录数：%s\n' "$changes"
-    else
-        printf '已更新 %s/%s 条记录\n' "$succeeded" "$changes"
-    fi
-    return "$status"
+    printf '同步完成，成功 %s 条，失败 %s 条。\n' "$succeeded" "$failed"
+    (( failed == 0 ))
 }
 
 validate_content() {
@@ -443,6 +455,12 @@ cron_path() {
 
 schedule() {
     local value="${1:-status}" current next output status=0 line count=0 interval script bash_bin quoted_bash quoted_script user
+    local quoted_log scope="${2:-}" cron_command=ddns
+    if [[ $scope ]]; then
+        [[ $scope == --sync-others && $value != status && $value != off ]] ||
+            { fail "--sync-others 只用于创建或更新定时任务"; return; }
+        cron_command+=' --sync-others'
+    fi
     command -v crontab >/dev/null || { fail "未找到 crontab，请先安装并启用 Cron 服务"; return; }
     current=$(LC_ALL=C crontab -l 2>&1) || status=$?
     if (( status != 0 )); then
@@ -457,7 +475,10 @@ schedule() {
     fi
     next=''
     while IFS= read -r line; do
-        if [[ $line != '#'* && ( $line == *" ddns $CRON_MARKER" || $line == *" clean-logs $LOG_CRON_MARKER" ) ]]; then
+        if [[ $line != '#'* && ( $line == *" ddns $CRON_MARKER" ||
+            $line == *" ddns >> "*" 2>&1 $CRON_MARKER" ||
+            $line == *" ddns --sync-others >> "*" 2>&1 $CRON_MARKER" ||
+            $line == *" clean-logs $LOG_CRON_MARKER" ) ]]; then
             ((count+=1))
             if [[ $value == status ]]; then printf '%s\n' "$line"; fi
         elif [[ $line || $current ]]; then
@@ -480,7 +501,8 @@ schedule() {
         script=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && printf '%s/%s' "$PWD" "$(basename -- "${BASH_SOURCE[0]}")") || return 1
         bash_bin=$(type -P bash) || return 1
         quoted_bash=$(cron_path "$bash_bin") && quoted_script=$(cron_path "$script") || return 1
-        next+="$interval * * * * $quoted_bash $quoted_script ddns $CRON_MARKER"$'\n'
+        quoted_log=$(cron_path "$DEFAULT_LOG") || return 1
+        next+="$interval * * * * umask 077; $quoted_bash $quoted_script $cron_command >> $quoted_log 2>&1 $CRON_MARKER"$'\n'
         next+="0 3 * * * $quoted_bash $quoted_script clean-logs $LOG_CRON_MARKER"$'\n'
     fi
     if ! output=$(printf '%s' "$next" | LC_ALL=C crontab - 2>&1); then
@@ -496,21 +518,12 @@ schedule() {
 
 clean_logs() {
     local rotated path stamp expired
-    if [[ -e $CONFIG_FILE ]]; then
-        load_assignments || return 1
-    elif [[ -e $PYTHON_FILE ]]; then
-        load_json_config "$PYTHON_FILE" || return 1
-    else
-        return 0
-    fi
-    [[ $LOG_FILE ]] || return 0
-    [[ $LOG_FILE == /* ]] || LOG_FILE="./$LOG_FILE"
     stamp=$(date '+%Y-%m-%d') || return 1
-    rotated="$LOG_FILE.cloudflare-ddns-sh.$stamp"
-    if [[ -f $LOG_FILE && ! -L $LOG_FILE && ! -e $rotated && ! -L $rotated ]]; then
-        mv -n -- "$LOG_FILE" "$rotated" && touch -- "$rotated" || return 1
+    rotated="$DEFAULT_LOG.cloudflare-ddns-sh.$stamp"
+    if [[ -f $DEFAULT_LOG && ! -L $DEFAULT_LOG && ! -e $rotated && ! -L $rotated ]]; then
+        mv -n -- "$DEFAULT_LOG" "$rotated" && touch -- "$rotated" || return 1
     fi
-    for path in "$LOG_FILE".cloudflare-ddns-sh.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+    for path in "$DEFAULT_LOG".cloudflare-ddns-sh.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
         [[ -f $path && ! -L $path ]] || continue
         expired=$(find "$path" -prune -type f -mtime +6 -print) || return 1
         if [[ $expired ]]; then
@@ -520,7 +533,7 @@ clean_logs() {
 }
 
 schedule_menu() {
-    local choice value
+    local choice value scope confirmed
     while :; do
         printf '\n%s\n' '定时任务' '1. 添加或更新 DDNS 和日志清理任务' '2. 删除这两项定时任务' '3. 查看定时任务' '0. 返回'
         read -r -p '请选择: ' choice || return 0
@@ -528,7 +541,22 @@ schedule_menu() {
             0) return 0 ;;
             1)
                 read -r -p 'DDNS 间隔（1–60 分钟，回车 5）: ' value || return 0
-                schedule "${value:-5}"
+                printf '%s\n' '1. 只更新主记录（默认）' '2. 主记录更新成功后，同步本区域其他同类型、未开启代理的地址记录'
+                read -r -p '同步范围 [1/2]: ' scope || return 0
+                case "${scope:-1}" in
+                    1) schedule "${value:-5}" ;;
+                    2)
+                        if [[ ! -f $CONFIG_FILE && ! -f $PYTHON_FILE ]]; then
+                            fail "请先完成 DDNS 配置"
+                            continue
+                        fi
+                        (load_config ddns && printf '主记录：%s (%s)，区域：%s\n' "$RECORD_NAME" "$RECORD_TYPE" "${BASE_DOMAIN:-$ZONE_ID}") ||
+                            continue
+                        read -r -p '确认保存并让后续定时任务批量更新这些记录？[y/N]: ' confirmed || return 0
+                        if [[ $confirmed == [yY] ]]; then schedule "${value:-5}" --sync-others; fi
+                        ;;
+                    *) fail "请选择 1 或 2" ;;
+                esac
                 ;;
             2) schedule off ;;
             3) schedule status ;;
@@ -571,8 +599,7 @@ menu_record() {
 }
 
 menu() {
-    local choice value confirmed
-    local -a args=()
+    local choice value
     while :; do
         printf '\n%s\n' 'Cloudflare DDNS 管理'
         printf '%s\n' '1. 创建或修改配置' '2. 立即更新 DDNS' '3. 新增 DNS 记录' '4. 修改 DNS 记录' \
@@ -587,11 +614,10 @@ menu() {
             5) (menu_record delete) ;;
             6)
                 read -r -p '记录类型 [A/AAAA，留空跟随配置]: ' value || return 0
-                args=()
-                [[ ! $value ]] || args+=(--type "$value")
-                if (main sync "${args[@]}" --dry-run); then
-                    read -r -p '执行以上批量同步？[y/N]: ' confirmed || return 0
-                    if [[ $confirmed == [yY] ]]; then (main sync "${args[@]}"); fi
+                if [[ ! $value || $value == A || $value == AAAA ]]; then
+                    (require_tools && load_config sync && sync_records "$value" confirm)
+                else
+                    fail "sync 只支持 A 和 AAAA"
                 fi
                 ;;
             7) schedule_menu ;;
@@ -600,8 +626,13 @@ menu() {
     done
 }
 
+require_tools() {
+    command -v jq >/dev/null || { fail "缺少 jq，请先安装 jq"; return; }
+    command -v curl >/dev/null || { fail "缺少 curl，请先安装 curl"; return; }
+}
+
 main() {
-    local command="${1:-ddns}" prefix='' kind='' ip='' ttl='' proxy='' dry_run=false
+    local command="${1:-ddns}" prefix='' kind='' ip='' ttl='' proxy='' mode=apply sync_others=false
     if (( $# )); then
         shift
     elif [[ -t 0 && -t 1 ]]; then
@@ -627,7 +658,7 @@ main() {
             return
             ;;
         schedule)
-            [[ $# -le 1 ]] || { fail "schedule 只接受一个参数"; return; }
+            [[ $# -le 2 ]] || { fail "用法：schedule [status|off|1–60 [--sync-others]]"; return; }
             schedule "$@"
             return
             ;;
@@ -659,7 +690,8 @@ main() {
             update:--no-proxied)
                 [[ $proxy != true ]] || { fail "代理选项冲突"; return; }
                 proxy=false ;;
-            sync:--dry-run) dry_run=true ;;
+            sync:--dry-run) mode=preview ;;
+            ddns:--sync-others) sync_others=true ;;
             *) fail "无效参数 $1。使用 --help 查看帮助"; return ;;
         esac
         shift
@@ -673,13 +705,19 @@ main() {
         fail "请指定要修改的 IP、TTL 或代理状态"
         return
     fi
-    command -v jq >/dev/null || { fail "缺少 jq，请先安装 jq"; return; }
-    if [[ $command == configure ]]; then configure; return; fi
-    command -v curl >/dev/null || { fail "缺少 curl，请先安装 curl"; return; }
+    if [[ $command == configure ]]; then
+        command -v jq >/dev/null || { fail "缺少 jq，请先安装 jq"; return; }
+        configure
+        return
+    fi
+    require_tools || return 1
     load_config "$command" || return 1
     case "$command" in
-        ddns) ddns ;;
-        sync) sync_records "$kind" "$dry_run" ;;
+        ddns)
+            ddns || return 1
+            if [[ $sync_others == true ]]; then sync_records "$RECORD_TYPE" apply "$DDNS_IP"; fi
+            ;;
+        sync) sync_records "$kind" "$mode" ;;
         add) manage_record "$command" "$prefix" "${kind:-A}" "$ip" "$ttl" "$proxy" ;;
         *) manage_record "$command" "$prefix" "$kind" "$ip" "$ttl" "$proxy" ;;
     esac

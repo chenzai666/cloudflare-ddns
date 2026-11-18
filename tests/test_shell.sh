@@ -8,8 +8,8 @@ TASK_DIR=$(mktemp -d)
 CONFIG_FILE="$TASK_DIR/config"
 PYTHON_FILE="$TASK_DIR/python.json"
 MANAGER_FILE="$TASK_DIR/manager.json"
-DEFAULT_LOG="$TASK_DIR/ddns.log"
-LOG_FILE="$DEFAULT_LOG"
+DEFAULT_LOG="$TASK_DIR/cloudflare_ddns.log"
+CUSTOM_LOG="$TASK_DIR/legacy-custom.log"
 CRONTAB_FILE="$TASK_DIR/crontab"
 REQUEST_FILE="$TASK_DIR/requests"
 TEST_LOG_SUFFIX=".cloudflare-ddns-sh.$(date '+%Y-%m-%d')"
@@ -17,7 +17,7 @@ EXPIRED_LOG="$DEFAULT_LOG.cloudflare-ddns-sh.2000-01-01"
 OTHER_LOG="$DEFAULT_LOG.cloudflare-ddns-py.2000-01-01"
 
 cleanup() {
-    rm -f -- "$CONFIG_FILE" "$MANAGER_FILE" "$DEFAULT_LOG" "$CRONTAB_FILE" "$REQUEST_FILE" \
+    rm -f -- "$CONFIG_FILE" "$MANAGER_FILE" "$DEFAULT_LOG" "$CUSTOM_LOG" "$CRONTAB_FILE" "$REQUEST_FILE" \
         "$DEFAULT_LOG$TEST_LOG_SUFFIX" "$EXPIRED_LOG" "$OTHER_LOG"
     rmdir -- "$TASK_DIR"
 }
@@ -39,6 +39,7 @@ RECORD_TYPE='A'
 TTL='60'
 BASE_DOMAIN='example.com'
 CONFIG
+printf "LOG_FILE='%s'\n" "$CUSTOM_LOG" >> "$CONFIG_FILE"
 
 SOURCE='{"id":"source","name":"ddns.example.com","type":"A","content":"192.0.2.1","ttl":1,"proxied":true}'
 OTHER='{"id":"one","name":"one.example.com","type":"A","content":"192.0.2.3","ttl":60,"proxied":false}'
@@ -72,7 +73,10 @@ curl() {
         [[ $line == 'Authorization: Bearer test-token' ]] || return 1
     fi
     printf '%s\t%s\t%s\n' "$method" "$url" "$payload" >> "$REQUEST_FILE"
-    if [[ $method != GET ]]; then
+    if [[ $method == PATCH && ( $MOCK == patch_error && $url == */two ||
+        $MOCK == ddns_error && $url == */source ) ]]; then
+        printf '%s\n403' '{"success":false,"errors":[{"message":"test write failure"}]}'
+    elif [[ $method != GET ]]; then
         api_body '{"success":true}'
     elif [[ $MOCK == multiple ]]; then
         api_body "{\"success\":true,\"result\":[$SOURCE,$SOURCE]}"
@@ -84,6 +88,8 @@ curl() {
         else
             api_body '{"success":true,"result":[]}'
         fi
+    elif [[ $MOCK == match ]]; then
+        api_body "{\"success\":true,\"result\":[$SOURCE,$PROXIED]}"
     elif [[ $url == *'&page=1' ]]; then
         api_body "{\"success\":true,\"result\":[$SOURCE,$OTHER,$PROXIED],\"result_info\":{\"page\":1,\"total_pages\":2}}"
     elif [[ $url == *'&page=2' && $MOCK == page_error ]]; then
@@ -116,11 +122,16 @@ assert test "$(normalize_ip AAAA '::192.0.2.1')" = "$(normalize_ip AAAA '::c000:
 if normalize_ip A '256.0.0.1' >/dev/null; then exit 1; fi
 if normalize_ip AAAA '2001:::1' >/dev/null; then exit 1; fi
 
-(main) >/dev/null
+manual_out=$(main)
+assert test ! -e "$DEFAULT_LOG"
+assert test ! -e "$CUSTOM_LOG"
+assert grep -F '已更新 ddns.example.com → 192.0.2.9' <<< "$manual_out"
 assert grep -F $'PATCH\thttps://api.cloudflare.com/client/v4/zones/11111111111111111111111111111111/dns_records/source\t{"content":"192.0.2.9"}' "$REQUEST_FILE"
 
 : > "$REQUEST_FILE"
-(main sync --dry-run) >/dev/null
+preview=$(main sync --dry-run)
+assert grep -F 'DDNS 源记录：ddns.example.com (A) → 192.0.2.1' <<< "$preview"
+assert grep -F 'two.example.com (A)  192.0.2.4 → 192.0.2.1' <<< "$preview"
 assert grep -F '&page=2' "$REQUEST_FILE"
 if grep -q '^PATCH' "$REQUEST_FILE"; then exit 1; fi
 
@@ -132,6 +143,27 @@ if grep -q '^PATCH' "$REQUEST_FILE"; then exit 1; fi
 (main sync) >/dev/null
 assert test "$(grep -c '^PATCH' "$REQUEST_FILE")" -eq 2
 if grep -q '/dns_records/proxy' "$REQUEST_FILE"; then exit 1; fi
+
+: > "$REQUEST_FILE"
+no_change=$( (
+    MOCK=match
+    load_config sync
+    sync_records A confirm
+    read -r pending
+    assert test "$pending" = y
+) <<< y)
+assert grep -F '没有需要更新的记录。本次未写入 Cloudflare。' <<< "$no_change"
+if grep -q '^PATCH' "$REQUEST_FILE"; then exit 1; fi
+
+: > "$REQUEST_FILE"
+confirmed=$(load_config sync && sync_records A confirm <<< y)
+assert grep -F '同步完成，成功 2 条，失败 0 条。' <<< "$confirmed"
+assert test "$(grep -c '^GET' "$REQUEST_FILE")" -eq 3
+assert test "$(grep -c '^PATCH' "$REQUEST_FILE")" -eq 2
+if patch_result=$(MOCK=patch_error main sync 2>&1); then exit 1; fi
+assert grep -F '更新成功：one.example.com' <<< "$patch_result"
+assert grep -F '更新失败：two.example.com' <<< "$patch_result"
+assert grep -F '同步完成，成功 1 条，失败 1 条。' <<< "$patch_result"
 
 : > "$REQUEST_FILE"
 (main add @ --type CNAME --ip dns.example.net --ttl auto) >/dev/null
@@ -148,13 +180,31 @@ if grep -q '^DELETE' "$REQUEST_FILE"; then exit 1; fi
 printf '%s\n' '{"API_TOKEN":"manager-token","ZONE_ID":"22222222222222222222222222222222","BASE_DOMAIN":"example.com","DDNS_RECORD":"ddns.example.com"}' > "$MANAGER_FILE"
 (MOCK=manager; main sync --dry-run) >/dev/null
 
-printf '%s\n' 'MAILTO=ops@example.org' '7 * * * * /opt/unrelated' '9 * * * * /opt/python ddns # cloudflare-ddns:py' > "$CRONTAB_FILE"
+: > "$REQUEST_FILE"
+(main ddns --sync-others) >/dev/null
+assert test "$(grep -c '^PATCH' "$REQUEST_FILE")" -eq 3
+assert test "$(grep -c '192.0.2.9' "$REQUEST_FILE")" -eq 3
+if grep -q '22222222222222222222222222222222\|/dns_records/proxy' "$REQUEST_FILE"; then exit 1; fi
+: > "$REQUEST_FILE"
+if (MOCK=ddns_error; main ddns --sync-others) 2>/dev/null; then exit 1; fi
+assert test "$(grep -c '^GET' "$REQUEST_FILE")" -eq 1
+assert test "$(grep -c '^PATCH' "$REQUEST_FILE")" -eq 1
+
+printf '%s\n' 'MAILTO=ops@example.org' '7 * * * * /opt/unrelated' '9 * * * * /opt/python ddns # cloudflare-ddns:py' \
+    '*/15 * * * * /opt/manual/cloudflare_ddns.sh ddns >> /var/log/manual-ddns.log 2>&1' > "$CRONTAB_FILE"
 cron_before=$(cat "$CRONTAB_FILE")
+printf '%s\n' '*/10 * * * * /opt/old/cloudflare_ddns.sh ddns # cloudflare-ddns:sh' \
+    '0 3 * * * /opt/old/cloudflare_ddns.sh clean-logs # cloudflare-ddns:sh-logs' >> "$CRONTAB_FILE"
 schedule 5 >/dev/null
 assert test "$(grep -c 'cloudflare-ddns:sh' "$CRONTAB_FILE")" -eq 2
-assert grep -E '^(\*/5 .* ddns # cloudflare-ddns:sh|0 3 .* clean-logs # cloudflare-ddns:sh-logs)$' "$CRONTAB_FILE"
+assert grep -F '*/5 * * * * umask 077;' "$CRONTAB_FILE"
+assert grep -F "ddns >> $(cron_path "$DEFAULT_LOG") 2>&1 # cloudflare-ddns:sh" "$CRONTAB_FILE"
+assert grep -E '^0 3 .* clean-logs # cloudflare-ddns:sh-logs$' "$CRONTAB_FILE"
+schedule 5 --sync-others >/dev/null
+assert grep -F "ddns --sync-others >> $(cron_path "$DEFAULT_LOG") 2>&1 # cloudflare-ddns:sh" "$CRONTAB_FILE"
+assert test "$(grep -c 'cloudflare-ddns:sh' "$CRONTAB_FILE")" -eq 2
 schedule 60 >/dev/null
-assert grep -E '^0 \* \* \* \* .* ddns # cloudflare-ddns:sh$' "$CRONTAB_FILE"
+assert grep -E '^0 \* \* \* \* umask 077;.* ddns >> .* 2>&1 # cloudflare-ddns:sh$' "$CRONTAB_FILE"
 assert test "$(grep -c 'cloudflare-ddns:sh' "$CRONTAB_FILE")" -eq 2
 schedule off >/dev/null
 assert test "$(cat "$CRONTAB_FILE")" = "$cron_before"
@@ -171,6 +221,7 @@ if bash "$SCRIPT_DIR/cloudflare_ddns.sh" unknown-command >/dev/null 2>&1; then
 fi
 
 printf 'active log\n' > "$DEFAULT_LOG"
+printf 'legacy custom log\n' > "$CUSTOM_LOG"
 printf 'expired log\n' > "$EXPIRED_LOG"
 printf 'other log\n' > "$OTHER_LOG"
 touch -t 200001010000 "$EXPIRED_LOG" "$OTHER_LOG"
@@ -179,5 +230,6 @@ assert test -f "$DEFAULT_LOG$TEST_LOG_SUFFIX"
 assert test ! -e "$DEFAULT_LOG"
 assert test ! -e "$EXPIRED_LOG"
 assert test -f "$OTHER_LOG"
+assert test "$(cat "$CUSTOM_LOG")" = 'legacy custom log'
 
 printf 'SH 离线测试通过。\n'

@@ -10,85 +10,22 @@ import json
 import logging
 import argparse
 import subprocess
-import importlib.util
+import ipaddress
+from getpass import getpass
+from urllib.parse import urlencode
 import re
 from pathlib import Path
-from datetime import datetime
 
 # 全局配置目录
 CFG_DIR = Path.home() / ".cloudflare_ddns"
 CFG_FILE = CFG_DIR / "config.json"
 LOG_FILE = CFG_DIR / "cloudflare_ddns.log"
 
-# ==========================================
-# 环境依赖自动准备区
-# ==========================================
-def check_dependencies():
-    """确保必要的依赖已安装"""
-    required = {'requests'}
-    installed = set()
-    
-    for module in required:
-        if importlib.util.find_spec(module) is None:
-            print(f"⏳ 缺少必要模块: {module}")
-            
-            # 尝试使用pip安装 (加入强制绕过系统环境限制和清华源)
-            python_exe = sys.executable
-            pip_cmd = [
-                python_exe, '-m', 'pip', 'install', module, 
-                '--break-system-packages', 
-                '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'
-            ]
-            
-            print(f"正在尝试强制安装 {module}...")
-            try:
-                subprocess.check_call(pip_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                print(f"✅ {module} 安装成功")
-                installed.add(module)
-            except subprocess.CalledProcessError:
-                print(f"❌ 无法自动安装 {module}")
-            
-            # 如果pip不可用，提示用户手动安装
-            try:
-                subprocess.check_call([python_exe, '-m', 'pip', '--version'], 
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                print("\n" + "="*50)
-                print("系统缺少pip包管理器，请手动安装:")
-                print("1. 首先安装pip:")
-                print("   Ubuntu/Debian: sudo apt install python3-pip")
-                print("   CentOS/RHEL: sudo yum install python3-pip")
-                print("2. 然后手动安装依赖:")
-                print(f"   pip install {module} --break-system-packages")
-                print("="*50)
-                print("\n")
-    
-    # 再次检查所有依赖是否安装成功
-    if not all(importlib.util.find_spec(m) for m in required):
-        print("❌ 依赖安装失败，请手动安装必要的Python模块")
-        sys.exit(1)
+MANAGER_FILE = Path.home() / ".cf_dns_manager" / "config.json"
 
-def check_mtr_tool():
-    """检查并自动安装 mtr 工具 (仅限 Linux)"""
-    if sys.platform.startswith('linux'):
-        if subprocess.call("command -v mtr", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
-            print("⏳ 未检测到 mtr 工具，正在通过 apt 自动为您安装...")
-            try:
-                subprocess.check_call("apt-get update && apt-get install mtr -y", shell=True, stdout=subprocess.DEVNULL)
-                print("✅ mtr 工具安装完成！")
-            except Exception as e:
-                print(f"⚠️ mtr 自动安装失败，请稍后手动执行: sudo apt install mtr -y")
+# 延迟加载依赖，让帮助和本地配置维护可以独立运行。
+requests = None
 
-# 在脚本开头检查依赖
-check_dependencies()
-check_mtr_tool()
-
-# 导入已确认安装的模块
-import requests
-
-# ==========================================
-# 核心逻辑区
-# ==========================================
 # 配置模板
 DEFAULT_CONFIG = {
     "API_TOKEN": "",
@@ -101,17 +38,19 @@ DEFAULT_CONFIG = {
 }
 
 class CloudflareDDNS:
-    def __init__(self):
+    def __init__(self, config=None):
         # 确保配置目录存在
-        CFG_DIR.mkdir(parents=True, exist_ok=True)
-        self.config = self.load_config()
+        if config is None:
+            CFG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            config = self.load_config()
+        self.config = config
         self.setup_logging()
         
     def load_config(self):
         """加载或创建配置"""
         if CFG_FILE.exists():
             try:
-                with open(CFG_FILE, 'r') as f:
+                with open(CFG_FILE, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     # 验证必要配置
                     if not config.get("API_TOKEN") or not config.get("ZONE_ID"):
@@ -122,7 +61,7 @@ class CloudflareDDNS:
                         config["MTR_TARGET"] = ""
                     return config
             except Exception as e:
-                print(f"配置文件损坏: {e}")
+                raise ValueError(f"请检查配置文件 {CFG_FILE}：{e}") from e
         
         # 首次运行，交互式配置
         return self.setup_wizard()
@@ -137,7 +76,7 @@ class CloudflareDDNS:
         config = DEFAULT_CONFIG.copy()
         
         # 获取必要信息
-        config["API_TOKEN"] = input("1. 请输入Cloudflare API Token: ").strip()
+        config["API_TOKEN"] = getpass("1. 请输入Cloudflare API Token: ").strip()
         if not config["API_TOKEN"]:
             print("错误：API Token不能为空！")
             sys.exit(1)
@@ -169,8 +108,10 @@ class CloudflareDDNS:
         mtr_input = input("7. [高级选项] MTR探测目标地址 (留空则默认获取本机常规外网出口IP，输入如 dix.yiandrive.com 则获取第一跳网关IP): ").strip()
         config["MTR_TARGET"] = mtr_input
         
+        config["BASE_DOMAIN"] = input("8. DNS 管理使用的区域域名（仅 DDNS 可留空）: ").strip()
+
         # 保存配置
-        with open(CFG_FILE, 'w') as f:
+        with open(CFG_FILE, 'x', encoding='utf-8', opener=lambda path, flags: os.open(path, flags, 0o600)) as f:
             json.dump(config, f, indent=2)
             
         print("\n✅ 配置已保存至:", CFG_FILE)
@@ -190,6 +131,7 @@ class CloudflareDDNS:
         # 移除所有已存在的处理器
         for handler in self.logger.handlers[:]:
             self.logger.removeHandler(handler)
+            handler.close()
         
         # 日志文件处理器 - 使用UTF-8编码
         file_handler = logging.FileHandler(log_path, encoding='utf-8')
@@ -218,9 +160,9 @@ class CloudflareDDNS:
         ))
         self.logger.addHandler(console_handler)
     
-    def get_public_ip(self):
+    def get_public_ip(self, record_type=None):
         """获取当前公网IP (根据配置选择 MTR 路由获取 或 常规 API 获取)"""
-        record_type = self.config["RECORD_TYPE"]
+        record_type = record_type or self.config["RECORD_TYPE"]
         mtr_target = self.config.get("MTR_TARGET", "").strip()
         
         if record_type == "A":
@@ -228,11 +170,14 @@ class CloudflareDDNS:
             if mtr_target:
                 self.logger.info(f"🔍 正在通过 MTR 探测 [{mtr_target}] 的入口/网关 IP...")
                 try:
-                    cmd = f"mtr -rw -c 1 {mtr_target} | awk 'NR==3 {{print $2}}'"
-                    result = subprocess.check_output(cmd, shell=True).decode().strip()
-                    
-                    # 验证是否抓取到有效的 IPv4 地址 (去除113限制)
-                    if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", result):
+                    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.:-]*", mtr_target):
+                        raise ValueError("MTR 目标不是有效的地址或主机名")
+                    output = subprocess.check_output(
+                        ["mtr", "-n", "-rw", "-c", "1", mtr_target], text=True, timeout=15
+                    )
+                    match = re.search(r"^\s*1\.\|--\s+(\S+)", output, re.MULTILINE)
+                    result = str(ipaddress.IPv4Address(match.group(1))) if match else ""
+                    if result:
                         self.logger.info(f"🎯 成功定位到网关/入口 IP: {result}")
                         return result
                     else:
@@ -252,11 +197,9 @@ class CloudflareDDNS:
                 try:
                     response = requests.get(service, timeout=10)
                     response.raise_for_status()
-                    ip_match = re.search(r'\d+\.\d+\.\d+\.\d+', response.text)
-                    if ip_match:
-                        ip = ip_match.group()
-                        self.logger.info(f"获取到公网IP: {ip} (来自 {service})")
-                        return ip
+                    ip = str(ipaddress.IPv4Address(response.text.strip()))
+                    self.logger.info(f"获取到公网IP: {ip} (来自 {service})")
+                    return ip
                 except Exception as e:
                     self.logger.debug(f"IP服务 {service} 失败: {str(e)}")
                     continue
@@ -271,7 +214,7 @@ class CloudflareDDNS:
                 try:
                     response = requests.get(service, timeout=10)
                     response.raise_for_status()
-                    ip = response.text.strip()
+                    ip = str(ipaddress.IPv6Address(response.text.strip()))
                     if ip:
                         self.logger.info(f"获取到IPv6: {ip}")
                         return ip
@@ -290,15 +233,8 @@ class CloudflareDDNS:
         }
         
         try:
-            if method == "GET":
-                response = requests.get(url, headers=headers)
-            elif method == "POST":
-                response = requests.post(url, headers=headers, json=data)
-            elif method == "PUT":
-                response = requests.put(url, headers=headers, json=data)
-            else:
-                raise ValueError(f"不支持的HTTP方法: {method}")
-                
+            response = requests.request(method, url, headers=headers, json=data, timeout=15,
+                                        allow_redirects=False)
             response.raise_for_status()
             return response.json()
                 
@@ -326,7 +262,7 @@ class CloudflareDDNS:
             return False
         
         # 查询现有DNS记录
-        query = f"dns_records?name={self.config['RECORD_NAME']}&type={self.config['RECORD_TYPE']}"
+        query = "dns_records?" + urlencode({"name": self.config["RECORD_NAME"], "type": self.config["RECORD_TYPE"]})
         result = self.cf_api_request("GET", query)
         
         if not result.get("success"):
@@ -335,7 +271,10 @@ class CloudflareDDNS:
             self.logger.error("===== DDNS 更新失败 =====")
             return False
         
-        records = result.get("result", [])
+        records = result.get("result")
+        if not isinstance(records, list):
+            self.logger.error("Cloudflare 未返回有效的记录列表")
+            return False
         
         # 记录不存在则创建
         if not records:
@@ -363,30 +302,26 @@ class CloudflareDDNS:
         
         # 处理多条记录
         if len(records) > 1:
-            self.logger.warning(f"{self.warning_symbol} 找到 {len(records)} 条匹配记录，将使用第一条")
+            self.logger.error("同名同类型记录有多条，请先确定唯一 DDNS 主记录")
+            return False
         
         record = records[0]
         record_id = record["id"]
         existing_ip = record["content"]
         
         # 检查IP是否变化
-        if existing_ip == current_ip:
+        if ipaddress.ip_address(existing_ip) == ipaddress.ip_address(current_ip):
             self.logger.info(f"{self.refresh_symbol} IP地址未变化 ({existing_ip})，无需更新")
             self.logger.info("===== DDNS 更新完成 =====")
             return True
         
         # 更新DNS记录
         self.logger.info(f"{self.refresh_symbol} 检测到IP变化: {existing_ip} → {current_ip}")
-        update_data = {
-            "type": self.config["RECORD_TYPE"],
-            "name": self.config["RECORD_NAME"],
-            "content": current_ip,
-            "ttl": self.config["TTL"],
-            "proxied": False
-        }
-        
-        update_result = self.cf_api_request("PUT", f"dns_records/{record_id}", update_data)
-        
+        update_data = {"content": current_ip}
+        if not record.get("proxied"):
+            update_data["ttl"] = self.config["TTL"]
+        update_result = self.cf_api_request("PATCH", f"dns_records/{record_id}", update_data)
+
         if update_result.get("success"):
             self.logger.info(f"{self.success_symbol} 更新成功! {self.config['RECORD_NAME']} → {current_ip}")
             self.logger.info("===== DDNS 更新完成 =====")
@@ -419,41 +354,84 @@ def delete():
     
     return deleted_files
 
-if __name__ == "__main__":
-    # 命令行参数解析
-    parser = argparse.ArgumentParser(description='Cloudflare DDNS 更新脚本')
-    parser.add_argument('-reconfig', action='store_true', help='重置配置文件并重新配置')
-    parser.add_argument('-delete', action='store_true', help='删除所有配置文件和日志')
-    args = parser.parse_args()
-    
-    # 删除配置选项
+def load_manager_config():
+    """优先沿用原记录管理器的账号和区域，避免混用不同区域的配置。"""
+    path = MANAGER_FILE if MANAGER_FILE.exists() else CFG_FILE
+    if not path.exists():
+        raise ValueError("请先运行 configure 完成配置，或恢复原管理器 config.json")
+    with path.open(encoding="utf-8") as f:
+        config = json.load(f)
+    if not isinstance(config, dict) or not config.get("API_TOKEN") or not config.get("ZONE_ID"):
+        raise ValueError(f"请检查 {path} 中的 API_TOKEN 和 ZONE_ID")
+    if path == MANAGER_FILE:
+        config["RECORD_NAME"] = config.get("DDNS_RECORD")
+        config.setdefault("DEFAULT_TTL", "auto")
+        config.setdefault("LOG_FILE", str(path.with_name("cf_dns_manager.log")))
+    else:
+        config.setdefault("LOG_FILE", str(LOG_FILE))
+    return config
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Cloudflare DDNS 和 DNS 记录管理")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("-reconfig", action="store_true", help="移除 DDNS 配置，下次运行重新配置")
+    modes.add_argument("-delete", action="store_true", help="清除本地 DDNS 配置和默认日志")
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("configure", help="创建或加载 DDNS 配置，不更新 DNS")
+    commands.add_parser("ddns", help="更新 DDNS 主记录（默认命令）")
+    try:
+        import cf_records
+    except ModuleNotFoundError as exc:
+        if exc.name != "cf_records":
+            raise
+        cf_records = None  # 保留原先只下载 cloudflare_ddns.py 的用法。
+        parser.epilog = "要使用记录管理命令，请下载完整仓库。"
+    if cf_records:
+        cf_records.register_commands(commands)
+    args = parser.parse_args(argv)
+    if args.command and (args.reconfig or args.delete):
+        parser.error("本地配置维护选项不能与子命令组合使用")
     if args.delete:
-        deleted = delete()
-        if deleted:
-            print("✅ 已删除以下文件:")
-            for file in deleted:
-                print(f"  - {file}")
-        else:
-            print("⚠️ 未找到配置文件或日志文件")
-        sys.exit()
-    
-    # 重新配置选项
+        for item in delete():
+            print(item)
+        return 0
     if args.reconfig:
         if CFG_FILE.exists():
             CFG_FILE.unlink()
-            print("✅ 配置已重置")
-            print("请重新运行脚本进行配置")
-        else:
-            print("配置文件不存在，无需重置")
-        sys.exit()
-    
+        print("重新运行 ddns 命令进行配置")
+        return 0
+    if args.command == "configure":
+        try:
+            CloudflareDDNS()
+            print(f"配置已就绪：{CFG_FILE}")
+            return 0
+        except (ValueError, OSError, EOFError) as exc:
+            print(f"配置失败：{exc}", file=sys.stderr)
+            return 1
+    global requests
     try:
-        ddns = CloudflareDDNS()
-        success = ddns.update_dns()
-        sys.exit(0 if success else 1)
-    except KeyboardInterrupt:
-        print("\n操作已取消")
-        sys.exit(1)
-    except Exception as e:
-        print(f"程序异常: {str(e)}")
-        sys.exit(1)
+        import requests
+    except ImportError:
+        print("请先在 Python 环境中安装 requests", file=sys.stderr)
+        return 1
+    try:
+        if args.command in (None, "ddns"):
+            ok = CloudflareDDNS().update_dns()
+        else:
+            config = load_manager_config()
+            if args.command != "sync" and not config.get("BASE_DOMAIN"):
+                raise ValueError("请在配置中填写 BASE_DOMAIN，例如 example.com")
+            client = CloudflareDDNS(config)
+            ok = cf_records.run(args, config, client.cf_api_request, client.get_public_ip)
+        return 0 if ok else 1
+    except (KeyboardInterrupt, EOFError):
+        print("操作已取消", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"操作失败：{exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -244,7 +244,6 @@ class CloudflareDDNS:
 
             # 常规/备用 IPv4 接口池
             ipv4_services = [
-                "http://txt.go.sohu.com/ip/sohu",
                 "https://api.ipify.org",
                 "https://ipv4.icanhazip.com"
             ]

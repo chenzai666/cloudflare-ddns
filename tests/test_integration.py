@@ -1,12 +1,16 @@
 import argparse
 import io
+import json
+import os
+import subprocess
+import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, mock_open, patch
 from urllib.parse import parse_qs, urlsplit
 
-import cf_records
 import cloudflare_ddns
 
 
@@ -18,7 +22,7 @@ def record(identifier, name, content="192.0.2.1", kind="A", proxied=False):
 class RecordCommandsTest(unittest.TestCase):
     def setUp(self):
         self.parser = argparse.ArgumentParser()
-        cf_records.register_commands(self.parser.add_subparsers(dest="command"))
+        cloudflare_ddns.register_commands(self.parser.add_subparsers(dest="command"))
         self.config = {"BASE_DOMAIN": "example.org", "RECORD_NAME": "home.example.org",
                        "RECORD_TYPE": "A", "DEFAULT_TTL": "auto"}
         self.get_ip = Mock(return_value="192.0.2.9")
@@ -26,7 +30,7 @@ class RecordCommandsTest(unittest.TestCase):
     def command(self, argv, api):
         self.output = io.StringIO()
         with redirect_stdout(self.output), redirect_stderr(self.output):
-            return cf_records.run(self.parser.parse_args(argv), self.config, api, self.get_ip)
+            return cloudflare_ddns.run(self.parser.parse_args(argv), self.config, api, self.get_ip)
 
     def test_sync_preview_apply_and_retry(self):
         source = record("s", "home", "192.0.2.9")
@@ -105,6 +109,73 @@ class RecordCommandsTest(unittest.TestCase):
 
 
 class UnifiedEntryTest(unittest.TestCase):
+    def test_interactive_start_uses_menu_and_cron_keeps_ddns(self):
+        with patch.object(cloudflare_ddns.sys.stdin, "isatty", return_value=True), \
+                patch.object(cloudflare_ddns.sys.stdout, "isatty", return_value=True), \
+                patch.object(cloudflare_ddns, "menu", return_value=0) as menu:
+            self.assertEqual(cloudflare_ddns.main([]), 0)
+            menu.assert_called_once()
+
+    def test_cron_schedule_replaces_only_python_entry(self):
+        original = (
+            "15 4 * * * /usr/local/bin/backup\n"
+            "*/5 * * * * /bin/bash /opt/ddns.sh ddns # cloudflare-ddns:sh\n"
+            "*/10 * * * * /usr/bin/python3 /old/ddns.py ddns # cloudflare-ddns:python\n"
+            "0 3 * * * /usr/bin/python3 /old/ddns.py clean-logs # cloudflare-ddns:python-logs\n"
+        )
+        with patch.object(subprocess, "run") as invoke, redirect_stdout(io.StringIO()):
+            invoke.return_value = subprocess.CompletedProcess([], 0, stdout=original, stderr="")
+            cloudflare_ddns._cron_schedule("60", ["/usr/bin/python3", "/opt/A B%/ddns.py"])
+            command, write = invoke.call_args
+            self.assertEqual(command[0], ["crontab", "-"])
+            self.assertEqual(write["input"], original[:original.rindex("*/10")] +
+                             "0 * * * * /usr/bin/python3 '/opt/A B\\%/ddns.py' ddns # cloudflare-ddns:python\n"
+                             "0 3 * * * /usr/bin/python3 '/opt/A B\\%/ddns.py' clean-logs # cloudflare-ddns:python-logs\n")
+            cloudflare_ddns._cron_schedule("off", [])
+            self.assertEqual(invoke.call_args.kwargs["input"], original[:original.rindex("*/10")])
+
+    def test_cron_read_failure_leaves_current_tasks_alone(self):
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 1, stdout="", stderr="permission denied")) as invoke:
+            with self.assertRaisesRegex(ValueError, "permission denied"):
+                cloudflare_ddns._cron_schedule("5", ["/usr/bin/python3", "/opt/ddns.py"])
+            invoke.assert_called_once()
+
+    def test_log_cleanup_only_removes_old_owned_archives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            config = folder / "config.json"
+            log = folder / "ddns.log"
+            old = folder / "ddns.log.ddns-python-20200101-030000-000000"
+            recent = folder / "ddns.log.ddns-python-20200102-030000-000000"
+            unrelated = folder / "ddns.log.ddns-sh-20200101-030000"
+            config.write_text(json.dumps({"LOG_FILE": str(log)}), encoding="utf-8")
+            for path in (log, old, recent, unrelated):
+                path.write_text(path.name, encoding="utf-8")
+            stale = time.time() - 8 * 24 * 60 * 60
+            os.utime(old, (stale, stale))
+            os.utime(unrelated, (stale, stale))
+            with patch.object(cloudflare_ddns, "CFG_FILE", config):
+                cloudflare_ddns.clean_logs()
+            self.assertFalse(log.exists())
+            self.assertFalse(old.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(unrelated.exists())
+            archived = set(folder.glob("ddns.log.ddns-python-*")) - {recent}
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(archived.pop().read_text(encoding="utf-8"), log.name)
+
+    def test_windows_schedules_two_distinct_operations(self):
+        with patch.object(cloudflare_ddns.sys, "platform", "win32"), \
+                patch.object(Path, "exists", return_value=True), \
+                patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as invoke:
+            cloudflare_ddns.schedule("5")
+        update, cleanup = [item.args[0] for item in invoke.call_args_list]
+        self.assertIn("MINUTE", update)
+        self.assertIn("DAILY", cleanup)
+        self.assertTrue(update[update.index("/TR") + 1].endswith(" ddns"))
+        self.assertTrue(cleanup[cleanup.index("/TR") + 1].endswith(" clean-logs"))
+
     def test_ddns_corrects_remote_change_and_preserves_proxy(self):
         config = {"RECORD_TYPE": "A", "RECORD_NAME": "home.example.org", "TTL": 60}
         remote = record("home", "home", "192.0.2.1", proxied=True)

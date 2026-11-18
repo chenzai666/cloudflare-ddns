@@ -243,7 +243,6 @@ get_ip() {
         # =====================================
 
         ip_services=(
-            "http://txt.go.sohu.com/ip/sohu"
             "https://api.ipify.org"
             "https://ipv4.icanhazip.com"
         )

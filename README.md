@@ -1,151 +1,53 @@
-### （new）新增配置文件重置、删除功能
-可以执行脚本在后边加上-h
+# Cloudflare DDNS 与 DNS 管理
 
-`/usr/local/bin/cloudflare_ddns.sh -h`
+任选 **SH** 或 **Python**，下载一个文件就能打开菜单。SH 版需要 Bash、curl 和 jq，适合 Linux、OpenWrt 和 NAS。Python 版只需要 Python 3，也可在 Windows 和 macOS 上运行。
 
-<img width="574" height="247" alt="image" src="https://github.com/user-attachments/assets/6902c2ea-f3ee-4690-adf3-5e9793e26979" />
+## 下载并打开菜单
 
+**SH 版**
 
-`/usr/local/bin/cloudflare_ddns.py -h`
+```bash
+curl -fLO https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/main/cloudflare_ddns.sh
+bash cloudflare_ddns.sh
+```
 
-<img width="589" height="266" alt="image" src="https://github.com/user-attachments/assets/4630d568-b84e-4cf6-b9b3-0c33b5ff727a" />
+**Python 版**
 
+```bash
+curl -fLO https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/main/cloudflare_ddns.py
+python3 cloudflare_ddns.py
+```
 
+Windows 可下载 Python 文件后运行 `py -3 cloudflare_ddns.py`。在终端里无参数运行会打开菜单，也可以显式加 `menu`。首次选择 **1**，输入 Cloudflare API Token、Zone ID 和要更新的完整域名。默认使用 A 记录。需要按前缀管理记录时，可以一并填写区域域名，例如 `example.com`。
 
-# cloudflare-ddns使用方法
-先准备以下信息
+## 菜单
 
-╔══════════════════════════════════════════════════╗
+| 选项 | 用途 |
+| --- | --- |
+| 1 配置或修改 | 保存 DDNS 设置。已有值可按回车保留，Token 输入时隐藏。 |
+| 2 立即更新 DDNS | 探测当前公网 IP，更新指定的 Cloudflare A 或 AAAA 主记录。每次都查询远端，手动改过的 IP 会在下一轮纠正。 |
+| 3、4、5 新增、修改、删除 | 管理单条 A、AAAA 或 CNAME 记录，支持根域名 `@`、TTL 和代理状态。 |
+| 6 批量同步 | 读取 Cloudflare 上的 DDNS 源记录，预览区域内同类型、未开启代理的其他地址记录，确认后才同步。 |
+| 7 定时任务 | 添加、查看或删除同一组的两项任务。 |
+| 0 退出 | 关闭菜单。 |
 
-║           Cloudflare DDNS 配置向导               ║
+### 定时任务
 
-║  所有配置将存储在: /root/.cloudflare_ddns         ║
+在菜单里选 **7 → 1** 添加两项任务。DDNS 更新默认每 5 分钟执行一次，间隔可修改。日志每天 **03:00** 轮转，并清理本版本生成的 7 天前归档。选 **7 → 2** 可一起移除这两项任务，选 **7 → 3** 查看。
 
-╚══════════════════════════════════════════════════╝
+Linux、OpenWrt 和 macOS 使用当前用户的 `crontab`，需有运行中的 cron 服务。Windows Python 版使用当前用户的任务计划程序，两项任务在该用户登录期间运行。请先把脚本放到长期使用的目录，再选一个版本添加任务。菜单仅替换或删除自己创建的任务，之前手写的 cron 仍由原位置管理。
 
-提示：括号内为默认值，直接按回车使用默认设置
+### 旧配置和命令
 
-──────────────────────────────────────────────────
+升级前备份原脚本和配置，同路径替换对应版本即可。SH 沿用 `~/.cloudflare_ddns/config`，Python 沿用 `~/.cloudflare_ddns/config.json`。两版的管理功能都会优先读取已有的 `~/.cf_dns_manager/config.json`，以保留原管理器使用的区域。没有旧管理器配置时，管理命令复用 DDNS 配置。区域域名可在菜单 **1** 中填写。留空时查询区域详情需要 Zone Read 权限。配置文件应限制为当前用户读取，API Token 只授予目标区域所需权限。
 
-1. 请输入Cloudflare API Token: 你的API Token
-2. 请输入Zone ID: 你的域名区域ID
-3. 请输入要更新的域名 (例如：ddns.example.com): 你的域名
-4. 记录类型 [A/AAAA] (默认: A，可直接按回车): 
-5. TTL值 [1-86400] (默认: 60，可直接按回车): 
-6. 日志文件路径 (默认: /root/.cloudflare_ddns/cloudflare_ddns.log，可直接按回车):
+原来不带参数的非交互定时任务继续执行单条 DDNS 更新。也可以明确写出子命令，例如 SH 版：
 
-──────────────────────────────────────────────────
+```bash
+bash cloudflare_ddns.sh ddns
+bash cloudflare_ddns.sh sync --type A --dry-run
+bash cloudflare_ddns.sh schedule 5
+bash cloudflare_ddns.sh schedule off
+```
 
-✅ 配置已保存到: /root/.cloudflare_ddns/config
-
-📝 日志将记录到: /root/.cloudflare_ddns/cloudflare_ddns.log
-
-下次运行脚本将自动使用这些配置
-
-══════════════════════════════════════════════════
-
-执行完成截图（示例）：
-
-<img width="698" height="322" alt="test" src="https://github.com/user-attachments/assets/b521c76c-de01-424a-9061-43f0a8bb4c31" />
-
-
-
-### 1. 安装必要依赖
-
-确保已安装 `jq` 工具：
-### Debian/Ubuntu
-`sudo apt update && sudo apt install -y jq curl`
-
-### CentOS/RHEL
-`sudo yum install -y epel-release`
-`sudo yum install -y jq curl`
-
-
-### 2. 获取 DDNS 脚本并执行
-`curl -# -o /usr/local/bin/cloudflare_ddns.sh https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/refs/heads/main/cloudflare_ddns.sh && chmod +x /usr/local/bin/cloudflare_ddns.sh && /usr/local/bin/cloudflare_ddns.sh`
-
-保存脚本路径为 `/usr/local/bin/cloudflare_ddns.sh`
-
-###也可使用python版本的脚本
-`curl -# -o /usr/local/bin/cloudflare_ddns.py https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/refs/heads/main/cloudflare_ddns.py && chmod +x /usr/local/bin/cloudflare_ddns.py && /usr/local/bin/cloudflare_ddns.py`
-
-保存脚本路径为 `/usr/local/bin/cloudflare_ddns.py`
-
-
-### 3. 设置 crontab 定时任务
-
-编辑当前用户的 crontab：
-`crontab -e`
-
-
-添加以下内容（每5分钟运行一次并记录日志）（shell版）：
-### 每5分钟运行一次DDNS脚本并记录日志
-`*/5 * * * * /usr/local/bin/cloudflare_ddns.sh >> /root/.cloudflare_ddns/cloudflare_ddns.log 2>&1`
-
-### 可选：每天凌晨清理日志（保留7天日志）
-`0 0 * * * find /root/.cloudflare_ddns/cloudflare_ddns.log -mtime +7 -delete`
-
-添加以下内容（每5分钟运行一次并记录日志）（python版）：
-### 每5分钟运行一次DDNS脚本并记录日志
-`*/5 * * * * /usr/local/bin/cloudflare_ddns.py >> /root/.cloudflare_ddns/cloudflare_ddns.log 2>&1`
-
-### 可选：每天凌晨清理日志（保留7天日志）
-`0 0 * * * find /root/.cloudflare_ddns/cloudflare_ddns.log -mtime +7 -delete`
-
-
-
-
-### 4. 监控日志文件
-
-你可以使用以下命令监控日志：
-
-# 实时查看日志
-`tail -f /root/.cloudflare_ddns/cloudflare_ddns.log`
-
-# 查看最后20条日志
-`tail -n 20 /root/.cloudflare_ddns/cloudflare_ddns.log`
-
-# 搜索错误
-`grep -i "error\|fail\|not found\|无法" /root/.cloudflare_ddns/cloudflare_ddns.log`
-
-
-### 5. 添加邮件通知（可选）
-
-如果你想在更新失败时收到邮件通知，可以修改 crontab：
-
-
-# 每5分钟运行一次，失败时发送邮件
-`*/5 * * * * /usr/local/bin/cloudflare_ddns.sh >> /root/.cloudflare_ddns/cloudflare_ddns.log 2>&1 || mail -s "Cloudflare DDNS Update Failed" your@email.com < /root/.cloudflare_ddns/cloudflare_ddns.log`
-
-
-确保系统已配置邮件服务（如 `sendmail` 或 `postfix`）。
-
-### 高级调试选项
-
-如果你想在脚本中添加调试输出，可以在脚本开头添加：
-
-
-# 启用详细调试
-`set -x  # 启用命令跟踪`
-# 或者
-`export DEBUG=true`
-
-# 在脚本中
-`if [ "$DEBUG" = "true" ]; then
-    # 输出调试信息
-fi`
-
-
-然后在 crontab 中设置环境变量：
-
-`*/5 * * * * DEBUG=true /usr/local/bin/cloudflare_ddns.sh >> /root/.cloudflare_ddns/cloudflare_ddns.log 2>&1`
-
-
-### 注意事项
-
-1. **权限问题**：确保脚本和日志文件有正确的读写权限
-2. **API Token权限**：确认API Token有足够的权限（Zone DNS Edit）
-3. **日志轮转**：对于长期运行，考虑设置日志轮转
-4. **IP获取服务**：如果某些IP服务被屏蔽，可以编辑 `get_ip()` 函数尝试其他服务
-
-这种设置会在系统后台定期运行DDNS更新脚本，同时在日志文件中记录所有操作和错误，便于监控更新状态和排查问题。
+Python 版使用相同子命令，例如 `python3 cloudflare_ddns.py ddns`。两版都可以用 `--help` 查看命令。旧 `-reconfig`、`-delete` 维护的是本地配置，`delete <前缀>` 删除的是远端记录。MTR 探测属于旧配置的可选项，使用时先安装 `mtr`。独立的 `ip_monitor.py` 仍可用于公网 IP 监控。

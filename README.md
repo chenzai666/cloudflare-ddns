@@ -2,7 +2,27 @@
 
 任选 **SH** 或 **Python**，下载一个文件就能打开菜单。SH 版需要 Bash、curl 和 jq，适合 Linux、OpenWrt 和 NAS。Python 版只需要 Python 3，也可在 Windows 和 macOS 上运行。
 
-## 下载并打开菜单
+## 一键安装或更新并打开菜单
+
+在运行原脚本的用户终端里执行对应的一条命令。原来用 root 跑就继续用 root，这样会读到原有配置。命令需要有权限写入 `/usr/local/bin`。
+
+两条命令都从 GitHub 主分支下载新版，先检查脚本语法，再备份旧脚本、同路径替换并打开菜单。SH 沿用 `~/.cloudflare_ddns/config`，Python 沿用 `~/.cloudflare_ddns/config.json`。
+
+**SH 版**
+
+```bash
+bash -c 'set -e; dst=/usr/local/bin/cloudflare_ddns.sh; tmp=$(mktemp "$dst.new.XXXXXX"); trap "rm -f -- \"\$tmp\"" EXIT; curl -fsSL https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/main/cloudflare_ddns.sh -o "$tmp"; bash -n "$tmp"; if [ -f "$dst" ]; then cp -p -- "$dst" "$dst.bak.$(date +%Y%m%d-%H%M%S).$$"; fi; chmod 755 "$tmp"; mv -f -- "$tmp" "$dst"; trap - EXIT; exec bash "$dst" menu'
+```
+
+**Python 版**
+
+```bash
+bash -c 'set -e; dst=/usr/local/bin/cloudflare_ddns.py; tmp=$(mktemp "$dst.new.XXXXXX"); trap "rm -f -- \"\$tmp\"" EXIT; curl -fsSL https://raw.githubusercontent.com/chenzai666/cloudflare-ddns/main/cloudflare_ddns.py -o "$tmp"; python3 -c "import sys; compile(open(sys.argv[1], \"rb\").read(), sys.argv[1], \"exec\")" "$tmp"; if [ -f "$dst" ]; then cp -p -- "$dst" "$dst.bak.$(date +%Y%m%d-%H%M%S).$$"; fi; chmod 755 "$tmp"; mv -f -- "$tmp" "$dst"; trap - EXIT; exec python3 "$dst" menu'
+```
+
+如需更新之前由菜单创建的定时任务，在新版菜单选 **7 → 1**。选同步范围 **1** 只更新主记录，选 **2** 会在主记录更新成功后同步其他符合条件的记录。
+
+### 下载到当前目录
 
 **SH 版**
 
